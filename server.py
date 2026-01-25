@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pronotepy
-from pronotepy.ent.generic_func import _open_ent_ng
+from pronotepy.ent.generic_func import _cas, _open_ent_ng
 from functools import partial
 from datetime import datetime, timedelta
 import logging
@@ -12,9 +12,11 @@ CORS(app)
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# CREATION D'UN ENT PERSONNALISE POUR SEINE-ET-MARNE
-# Utilise la VRAIE URL : https://ent.seine-et-marne.fr/
-ent_seine_et_marne = partial(_open_ent_ng, url="https://ent.seine-et-marne.fr/auth/login")
+# CREATION D'ENT PERSONNALISES POUR SEINE-ET-MARNE
+# Essayons avec CAS au lieu de Open ENT NG
+ent_77_cas = partial(_cas, url="https://ent77.seine-et-marne.fr/cas/login")
+ent_77_cas_new = partial(_cas, url="https://ent.seine-et-marne.fr/cas/login")
+ent_77_open = partial(_open_ent_ng, url="https://ent.seine-et-marne.fr/auth/login")
 
 @app.route('/sync', methods=['POST'])
 def sync_pronote():
@@ -39,22 +41,24 @@ def sync_pronote():
         client = None
         last_error = ""
         
-        # On essaie d'abord avec notre ENT personnalise
-        ent_list = [
-            ('ENT Seine-et-Marne (ent.seine-et-marne.fr)', ent_seine_et_marne),
+        # Liste des methodes d'authentification a tester
+        ent_methods = [
+            ('CAS ent77.seine-et-marne.fr', ent_77_cas),
+            ('CAS ent.seine-et-marne.fr', ent_77_cas_new),
+            ('Open ENT ent.seine-et-marne.fr', ent_77_open),
         ]
         
-        # Ajouter les autres ENT en fallback
+        # Ajouter les ENT standards de pronotepy
         import pronotepy.ent as ent_module
         if hasattr(ent_module, 'ent77'):
-            ent_list.append(('ENT77', ent_module.ent77))
+            ent_methods.append(('ent77 (pronotepy)', ent_module.ent77))
         if hasattr(ent_module, 'ile_de_france'):
-            ent_list.append(('Ile-de-France', ent_module.ile_de_france))
+            ent_methods.append(('ile_de_france', ent_module.ile_de_france))
         
         # Connexion directe en dernier
-        ent_list.append(('Direct', None))
+        ent_methods.append(('Direct', None))
 
-        for ent_name, ent_func in ent_list:
+        for ent_name, ent_func in ent_methods:
             try:
                 logger.info(f">>> Essai : {ent_name}")
                 if ent_func:
@@ -72,9 +76,9 @@ def sync_pronote():
                 client = None
 
         if not client or not client.logged_in:
-            return jsonify({'error': f'Echec connexion. {last_error[:80]}'}), 401
+            return jsonify({'error': f'Echec. {last_error[:80]}'}), 401
 
-        # --- RECUPERATION DES DONNEES ---
+        # --- DONNEES ---
         result = {
             'studentData': {
                 'name': client.info.name,
@@ -110,8 +114,7 @@ def sync_pronote():
 
         # Devoirs
         try:
-            hws = client.homework(datetime.now(), datetime.now() + timedelta(days=14))
-            for i, hw in enumerate(hws):
+            for i, hw in enumerate(client.homework(datetime.now(), datetime.now() + timedelta(days=14))):
                 result['homework'].append({
                     'id': i,
                     'subject': hw.subject.name if hw.subject else 'Devoir',
@@ -146,23 +149,11 @@ def sync_pronote():
                 except: pass
             if count > 0:
                 result['studentData']['average'] = round(total/count, 1)
-            logger.info(f"Notes: {len(result['grades'])}, Moyenne: {result['studentData']['average']}")
-            
-            # Moyennes par matiere
-            for avg in period.averages:
-                try:
-                    result['subjectAverages'].append({
-                        'subject': avg.subject.name,
-                        'average': float(avg.student.replace(',', '.')) if avg.student else 0,
-                        'classAvg': float(avg.class_average.replace(',', '.')) if avg.class_average else 0,
-                        'color': 'bg-indigo-500',
-                        'icon': 'fa-book'
-                    })
-                except: pass
+            logger.info(f"Notes: {len(result['grades'])}")
         except Exception as e:
             logger.error(f"Notes: {e}")
 
-        logger.info(f"=== FIN SYNCHRO {client.info.name} ===")
+        logger.info(f"=== FIN {client.info.name} ===")
         return jsonify(result)
 
     except Exception as e:
