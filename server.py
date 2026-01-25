@@ -12,67 +12,105 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def sync_with_ent77(username, password, school_url):
+def sync_pronote_clone(username, password, pronote_url):
     session = requests.Session()
+    
+    # 1. IMITATION PARFAITE DE VOS HEADERS (AVG Secure Browser)
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 AVG/143.0.0.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'fr-FR,fr;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'DNT': '1',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Priority': 'u=0, i'
     })
     
     try:
-        # 1. On part de Pronote pour générer le lien de connexion avec "callback"
-        pronote_url = f"{school_url}eleve.html"
-        logger.info(f"Démarrage : {pronote_url}")
+        # 2. Requete Initiale sur Pronote (pour déclencher la redirection CAS)
+        logger.info(f"1. GET {pronote_url}")
         res = session.get(pronote_url, allow_redirects=True)
         
-        # On extrait le lien de retour (callback) qui se trouve dans l'URL de l'ENT
-        ent_login_url = res.url
-        logger.info(f"URL de login détectée : {ent_login_url}")
+        # On doit atterrir sur la page de login de l'ENT
+        logger.info(f"   Redirigé vers : {res.url}")
         
-        parsed_url = urlparse(ent_login_url)
-        callback = parse_qs(parsed_url.query).get('callback', [None])[0]
+        # 3. Récupération du formulaire ENT
+        soup = BeautifulSoup(res.text, 'html.parser')
+        form = soup.find('form')
         
-        if callback:
-            callback = unquote(callback)
-            logger.info(f"Lien de retour Pronote trouvé : {callback}")
-
-        # 2. Authentification sur le portail ENT77
-        logger.info("Envoi des identifiants au portail...")
-        payload = {'email': username, 'password': password}
-        # On poste sur l'URL de login
-        auth_res = session.post("https://ent.seine-et-marne.fr/auth/login", data=payload, allow_redirects=True)
-        
-        # 3. ÉTAPE CRUCIALE : Suivre le lien de retour vers Pronote
-        # Si après le login on n'est pas sur Pronote, on "force" le lien de retour
-        if callback and "pronote" not in auth_res.url.lower():
-            logger.info("Redirection manuelle vers Pronote via le callback...")
-            res_final = session.get(callback, allow_redirects=True)
-        else:
-            res_final = auth_res
-
-        logger.info(f"URL finale atteinte : {res_final.url}")
-
-        # 4. Si on a réussi à entrer dans Pronote
-        if "pronote" in res_final.url.lower():
-            return parse_pronote(res_final.text, username)
+        if form:
+            action = form.get('action')
+            if action.startswith('/'):
+                parsed = urlparse(res.url)
+                action = f"{parsed.scheme}://{parsed.netloc}{action}"
             
-        return None
-    except Exception as e:
-        logger.error(f"Erreur de synchro : {e}")
+            # Récupérer le callback (le lien de retour vers Pronote)
+            parsed_url = urlparse(res.url)
+            callback = parse_qs(parsed_url.query).get('callback', [''])[0]
+            if callback and '?' not in action:
+                action += f"?callback={callback}"
+            
+            logger.info(f"   Formulaire trouvé, action : {action}")
+            
+            # Chercher les noms des champs (email/username)
+            user_field = 'email'
+            if soup.find('input', {'name': 'username'}): user_field = 'username'
+            
+            # 4. Envoi des identifiants (POST)
+            # IMPORTANT : On ajoute les headers spécifiques pour le POST
+            post_headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': 'https://ent.seine-et-marne.fr',
+                'Referer': res.url
+            }
+            
+            logger.info(f"2. POST Identifiants...")
+            res_login = session.post(
+                action, 
+                data={user_field: username, 'password': password},
+                headers=post_headers,
+                allow_redirects=True
+            )
+            
+            logger.info(f"   Status POST : {res_login.status_code}")
+            logger.info(f"   URL après login : {res_login.url}")
+            
+            # 5. Si on est revenu sur l'ENT au lieu de Pronote, forcer le callback
+            final_res = res_login
+            if "ent.seine-et-marne" in res_login.url and callback:
+                logger.info("   Redirection manuelle vers le callback...")
+                final_res = session.get(callback, allow_redirects=True)
+                
+            # 6. Extraction des données
+            if "pronote" in final_res.url.lower():
+                logger.info("✅ SUCCES : Page Pronote atteinte !")
+                return extract_data(final_res.text, username)
+            else:
+                logger.warning("❌ Echec : Pas sur Pronote")
+                
         return None
 
-def parse_pronote(html, username):
-    # Données par défaut si le reste est chiffré
+    except Exception as e:
+        logger.error(f"Erreur : {e}")
+        return None
+
+def extract_data(html, username):
     data = {
-        'studentData': {'name': username, 'class': 'Classe identifiée', 'average': 14.5, 'rank': 3, 'totalStudents': 28},
+        'studentData': {'name': username, 'class': 'Classe inconnue', 'average': 0, 'rank': 1, 'totalStudents': 30},
         'schedule': [[], [], [], [], []], 'homework': [], 'grades': [], 'auth_success': True
     }
     
-    # On cherche le vrai NOM et la vrai CLASSE dans les variables cachées de Pronote
+    # Nom
     m_nom = re.search(r"Nom\s*:\s*['\"]([^'\"]+)['\"]", html)
     m_pre = re.search(r"Prenom\s*:\s*['\"]([^'\"]+)['\"]", html)
     if m_nom and m_pre:
         data['studentData']['name'] = f"{m_pre.group(1)} {m_nom.group(1)}"
-    
+        
+    # Classe
     m_class = re.search(r"Classe\s*:\s*['\"]([^'\"]+)['\"]", html)
     if m_class:
         data['studentData']['class'] = m_class.group(1)
@@ -86,11 +124,11 @@ def sync_pronote():
         url = req.get('schoolUrl', '')
         if not url.endswith('/'): url += '/'
         
-        result = sync_with_ent77(req.get('username'), req.get('password'), url)
+        result = sync_pronote_clone(req.get('username'), req.get('password'), url + 'eleve.html')
         
         if result:
             return jsonify(result)
-        return jsonify({'error': 'La connexion a réussi mais Pronote bloque l\'accès. Vérifiez vos identifiants.'}), 401
+        return jsonify({'error': 'Échec de connexion (vérifiez vos identifiants)'}), 401
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
