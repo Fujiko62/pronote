@@ -8,33 +8,35 @@ app = Flask(__name__)
 CORS(app)
 
 def get_available_ents():
-    """Recupere les ENT disponibles dans pronotepy de facon robuste"""
-    ent_list = [None]
+    """Priorise les ENT de Seine-et-Marne et Ile-de-France"""
+    ent_list = []
     try:
         import pronotepy.ent as ent_module
-        ent_names = [
-            'ile_de_france', 'paris_classe_numerique', 'monlycee_net',
-            'ent_somme', 'ac_reunion', 'ac_reims', 'occitanie_montpellier',
-            'cas_agora06', 'eclat_bfc', 'laclasse_lyon', 'ent_mayotte',
-            'ent_hdf', 'ent_var', 'atrium_sud', 'ac_orleans_tours',
-            'ac_poitiers', 'ac_rennes', 'neoconnect_guadeloupe',
-            'pronote_hubeduconnect', 'ent_77'
+        
+        # Liste prioritaire pour le 77 (Seine-et-Marne)
+        priority_names = ['ent_77', 'ile_de_france', 'monlycee_net', 'educonnect']
+        
+        # Autres ENT au cas ou
+        other_names = [
+            'paris_classe_numerique', 'ent_somme', 'ac_reunion', 'ac_reims', 
+            'occitanie_montpellier', 'cas_agora06', 'eclat_bfc', 'laclasse_lyon', 
+            'ent_mayotte', 'ent_hdf', 'ent_var', 'atrium_sud'
         ]
-        for name in ent_names:
+        
+        for name in priority_names + other_names:
             if hasattr(ent_module, name):
                 ent_list.append(getattr(ent_module, name))
+                
+        # Ajouter la connexion directe a la fin
+        ent_list.append(None)
     except Exception as e:
         print(f"Erreur chargement ENT: {e}")
     return ent_list
 
 def get_ent_display_name(ent):
-    """Retourne le nom de l'ENT de facon securisee"""
-    if ent is None:
-        return "Direct (sans ENT)"
-    if hasattr(ent, '__name__'):
-        return ent.__name__
-    if isinstance(ent, functools.partial):
-        return f"Partial({ent.func.__name__})"
+    if ent is None: return "Direct (sans ENT)"
+    if hasattr(ent, '__name__'): return ent.__name__
+    if isinstance(ent, functools.partial): return f"Partial({ent.func.__name__})"
     return str(ent)
 
 @app.route('/sync', methods=['POST'])
@@ -54,35 +56,36 @@ def sync_pronote():
             school_url += '/'
         pronote_url = school_url + 'eleve.html'
         
-        print(f"\n{'='*60}\nTENTATIVE: {username} sur {pronote_url}\n{'='*60}")
+        print(f"\n{'='*60}\nDEBUT SYNCHRO: {username}\n{'='*60}")
         
         client = None
-        used_ent_name = None
         ent_list = get_available_ents()
         
         for ent in ent_list:
             ent_name = get_ent_display_name(ent)
             try:
-                print(f"  Essai: {ent_name}...")
+                print(f"  Tentative avec: {ent_name}...")
                 if ent:
                     client = pronotepy.Client(pronote_url, username=username, password=password, ent=ent)
                 else:
                     client = pronotepy.Client(pronote_url, username=username, password=password)
                 
                 if client.logged_in:
-                    print(f"  ✅ SUCCES avec {ent_name}!")
-                    used_ent_name = ent_name
+                    print(f"  ✅ CONNECTE via {ent_name}!")
                     break
                 client = None
             except Exception as e:
-                print(f"  ❌ Echec {ent_name}: {str(e)[:60]}")
+                msg = str(e).lower()
+                print(f"  ❌ {ent_name}: {msg[:50]}")
+                # Si le message indique clairement un mauvais mot de passe, on arrete de tester les autres
+                if "mot de passe" in msg or "password" in msg or "invalid credentials" in msg:
+                    return jsonify({'error': 'Identifiants Pronote incorrects.'}), 401
                 client = None
-                continue
         
         if not client or not client.logged_in:
-            return jsonify({'error': 'Connexion impossible. Verifiez vos identifiants.'}), 401
+            return jsonify({'error': 'Aucun mode de connexion trouvé. Verifiez vos acces.'}), 401
         
-        # Données de base
+        # On construit les donnees
         result = {
             'studentData': {
                 'name': client.info.name,
@@ -91,80 +94,45 @@ def sync_pronote():
             },
             'schedule': [[], [], [], [], []],
             'homework': [],
-            'grades': [],
-            'subjectAverages': [],
-            'messages': []
+            'grades': []
         }
         
-        # Recup Emploi du temps
+        # Emploi du temps
         try:
             today = datetime.now()
             monday = today - timedelta(days=today.weekday())
             for day in range(5):
-                current = monday + timedelta(days=day)
-                lessons = client.lessons(current, current)
-                for lesson in lessons:
-                    subj = lesson.subject.name if lesson.subject else 'Cours'
+                lessons = client.lessons(monday + timedelta(days=day))
+                for l in lessons:
                     result['schedule'][day].append({
-                        'time': f"{lesson.start.strftime('%H:%M')} - {lesson.end.strftime('%H:%M')}",
-                        'subject': subj,
-                        'teacher': lesson.teacher_name or '',
-                        'room': lesson.classroom or '',
-                        'color': 'bg-indigo-500'
+                        'time': f"{l.start.strftime('%H:%M')} - {l.end.strftime('%H:%M')}",
+                        'subject': l.subject.name if l.subject else 'Cours',
+                        'teacher': l.teacher_name or '',
+                        'room': l.classroom or '',
+                        'color': 'bg-indigo-500' if not l.canceled else 'bg-red-500'
                     })
-                result['schedule'][day].sort(key=lambda x: x['time'])
         except: pass
 
-        # Recup Devoirs
+        # Devoirs
         try:
-            for i, hw in enumerate(client.homework(datetime.now(), datetime.now() + timedelta(days=14))[:12]):
+            hws = client.homework(datetime.now(), datetime.now() + timedelta(days=7))
+            for hw in hws:
                 result['homework'].append({
-                    'id': i + 1,
                     'subject': hw.subject.name if hw.subject else 'Devoir',
-                    'title': hw.description or '',
+                    'title': hw.description,
                     'dueDate': hw.date.strftime('%d/%m'),
-                    'urgent': i < 2,
-                    'done': getattr(hw, 'done', False),
-                    'color': 'bg-indigo-500'
+                    'done': getattr(hw, 'done', False)
                 })
         except: pass
 
-        # Recup Notes
-        try:
-            total, count = 0, 0
-            for period in client.periods:
-                for grade in period.grades:
-                    try:
-                        val = float(str(grade.grade).replace(',', '.'))
-                        mx = float(str(grade.out_of).replace(',', '.')) if grade.out_of else 20
-                        total += (val / mx) * 20
-                        count += 1
-                        result['grades'].append({
-                            'subject': grade.subject.name,
-                            'grade': val,
-                            'max': mx,
-                            'date': grade.date.strftime('%d/%m'),
-                            'comment': grade.comment or '',
-                            'average': val
-                        })
-                    except: pass
-                break
-            if count > 0:
-                result['studentData']['average'] = round(total / count, 1)
-        except: pass
-        
-        print(f"🎉 Synchro terminee pour {client.info.name}")
         return jsonify(result)
         
     except Exception as e:
-        print(f"❌ Erreur generale: {e}")
+        print(f"Erreur: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health')
 def health(): return jsonify({'status': 'ok'})
-
-@app.route('/')
-def home(): return "Pronote Sync Server is Running"
 
 if __name__ == '__main__':
     import os
