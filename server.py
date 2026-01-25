@@ -1,6 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pronotepy
+import pronotepy.cryptography
+import pronotepy.pronoteAPI
+import pronotepy.dataClasses
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -38,17 +41,26 @@ class CustomClient(pronotepy.Client):
         
         # Parametres
         self.communication = pronotepy.pronoteAPI.Communication(self.pronote_url, self.attributes, self.encryption, self.session)
+        
+        # Obtenir les options et periode
         self.func_options = self.communication.post('FonctionParametres', {'donnees': {'Uuid': self.encryption.uuid}})
         
         # On considere qu'on est deja loggue
         self.logged_in = True
+        self.calculated_username = "Utilisateur" # Placeholder
         
         # Recuperer les infos utilisateur
         self.user_data = self.communication.post('ParametresUtilisateur', {})
         if self.user_data and 'donnees' in self.user_data:
             self.info = pronotepy.dataClasses.User(self.user_data['donnees']['ressource'])
-            self.periods = [pronotepy.dataClasses.Period(p) for p in self.func_options['donnees']['listePeriodes']]
-            self.current_period = next((p for p in self.periods if p.is_current), self.periods[0] if self.periods else None)
+            
+            # Periodes
+            if 'donnees' in self.func_options and 'listePeriodes' in self.func_options['donnees']:
+                self.periods = [pronotepy.dataClasses.Period(p) for p in self.func_options['donnees']['listePeriodes']]
+                self.current_period = next((p for p in self.periods if p.is_current), self.periods[0] if self.periods else None)
+            else:
+                self.periods = []
+                self.current_period = None
 
 # --- SCRAPING CAS ---
 
