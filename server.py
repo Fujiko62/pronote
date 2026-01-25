@@ -4,6 +4,7 @@ import pronotepy
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs, urlencode
 import logging
 import re
 
@@ -16,114 +17,150 @@ logger = logging.getLogger(__name__)
 def login_ent_seine_et_marne(username, password, pronote_url):
     """
     Authentification personnalisee pour l'ENT Seine-et-Marne
-    Gere le flux complexe de redirection
     """
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
     })
     
-    logger.info("=== Debut authentification ENT Seine-et-Marne ===")
+    logger.info("=== Authentification ENT Seine-et-Marne ===")
     
     try:
-        # Etape 1: Acceder a Pronote pour obtenir l'URL de redirection ENT
-        logger.info("Etape 1: Acces initial a Pronote...")
-        resp = session.get(pronote_url, allow_redirects=True)
-        logger.debug(f"URL finale: {resp.url}")
-        logger.debug(f"Status: {resp.status_code}")
+        # Etape 1: Acceder a Pronote
+        logger.info("Etape 1: Acces Pronote...")
+        resp1 = session.get(pronote_url, allow_redirects=True)
+        logger.info(f"URL apres redirection: {resp1.url}")
         
-        # Etape 2: Analyser la page de l'ENT
-        soup = BeautifulSoup(resp.text, 'html.parser')
+        # Sauvegarder le callback pour plus tard
+        parsed_url = urlparse(resp1.url)
+        callback = parse_qs(parsed_url.query).get('callback', [''])[0]
+        logger.info(f"Callback: {callback[:80]}...")
         
-        # Chercher le formulaire de connexion
+        # Etape 2: Parser le formulaire
+        soup = BeautifulSoup(resp1.text, 'html.parser')
+        
+        # Chercher le formulaire
         form = soup.find('form')
-        if form:
-            logger.info("Formulaire trouve!")
-            action = form.get('action', '')
-            logger.debug(f"Action du formulaire: {action}")
+        if not form:
+            # Peut-etre que le formulaire est dans un iframe ou charge par JS
+            logger.warning("Pas de formulaire trouve, recherche alternative...")
             
-            # Extraire tous les champs du formulaire
-            inputs = {}
-            for inp in form.find_all('input'):
-                name = inp.get('name')
-                value = inp.get('value', '')
-                if name:
-                    inputs[name] = value
-                    logger.debug(f"Champ: {name} = {value[:20] if value else '(vide)'}...")
+            # Chercher des liens de connexion
+            login_link = soup.find('a', href=re.compile(r'auth|login|connect', re.I))
+            if login_link:
+                logger.info(f"Lien de connexion trouve: {login_link.get('href')}")
             
-            # Ajouter les identifiants
-            # Chercher les noms de champs pour username/password
-            for key in inputs.keys():
-                if 'user' in key.lower() or 'login' in key.lower() or 'email' in key.lower():
-                    inputs[key] = username
-                    logger.info(f"Username dans le champ: {key}")
-                elif 'pass' in key.lower() or 'pwd' in key.lower():
-                    inputs[key] = password
-                    logger.info(f"Password dans le champ: {key}")
+            return None
+        
+        # Recuperer l'action du formulaire
+        action = form.get('action', '')
+        method = form.get('method', 'POST').upper()
+        
+        logger.info(f"Formulaire: action={action}, method={method}")
+        
+        # Recuperer TOUS les champs (y compris hidden)
+        form_data = {}
+        for inp in form.find_all(['input', 'select', 'textarea']):
+            name = inp.get('name')
+            if not name:
+                continue
             
-            # Si pas trouve, essayer les noms standards
-            if 'username' not in str(inputs.values()):
-                inputs['username'] = username
-            if 'password' not in str(inputs.values()):
-                inputs['password'] = password
+            input_type = inp.get('type', 'text').lower()
+            value = inp.get('value', '')
             
-            # Construire l'URL d'action
-            if action.startswith('/'):
-                # URL relative
-                from urllib.parse import urlparse
-                parsed = urlparse(resp.url)
-                action_url = f"{parsed.scheme}://{parsed.netloc}{action}"
-            elif action.startswith('http'):
-                action_url = action
+            # Pour les checkbox/radio, ne prendre que si checked
+            if input_type in ['checkbox', 'radio']:
+                if inp.get('checked'):
+                    form_data[name] = value or 'on'
             else:
-                action_url = resp.url
+                form_data[name] = value
             
-            logger.info(f"Etape 2: Envoi du formulaire a {action_url}")
+            logger.debug(f"  Champ [{input_type}]: {name} = '{value[:30] if value else ''}'")
+        
+        # Remplir les identifiants
+        # Chercher le champ email/username
+        email_fields = ['email', 'mail', 'username', 'login', 'identifiant', 'user']
+        for field in email_fields:
+            if field in form_data:
+                form_data[field] = username
+                logger.info(f"  → Username dans '{field}'")
+                break
+        
+        # Chercher le champ password
+        pwd_fields = ['password', 'passwd', 'pwd', 'pass', 'mdp', 'motdepasse']
+        for field in pwd_fields:
+            if field in form_data:
+                form_data[field] = password
+                logger.info(f"  → Password dans '{field}'")
+                break
+        
+        # Ajouter le callback si present dans le formulaire
+        if callback and 'callback' in form_data:
+            form_data['callback'] = callback
+        
+        # Construire l'URL d'action complete
+        if action.startswith('http'):
+            action_url = action
+        elif action.startswith('/'):
+            action_url = f"{parsed_url.scheme}://{parsed_url.netloc}{action}"
+        else:
+            action_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{action}"
+        
+        # Ajouter le callback a l'URL si necessaire
+        if callback and '?' not in action_url:
+            action_url = f"{action_url}?callback={callback}"
+        
+        logger.info(f"Etape 3: POST vers {action_url}")
+        logger.debug(f"Donnees: {list(form_data.keys())}")
+        
+        # Envoyer le formulaire
+        resp2 = session.post(
+            action_url, 
+            data=form_data, 
+            allow_redirects=True,
+            headers={
+                'Referer': resp1.url,
+                'Origin': f"{parsed_url.scheme}://{parsed_url.netloc}"
+            }
+        )
+        
+        logger.info(f"Reponse: {resp2.status_code}, URL: {resp2.url}")
+        
+        # Verifier si on a reussi
+        if 'pronote' in resp2.url.lower():
+            logger.info("✅ Redirection vers Pronote!")
             
-            # Envoyer le formulaire
-            resp2 = session.post(action_url, data=inputs, allow_redirects=True)
-            logger.debug(f"Reponse: {resp2.status_code}, URL: {resp2.url}")
-            
-            # Verifier si on est arrive sur Pronote
-            if 'pronote' in resp2.url.lower() and 'eleve.html' in resp2.url.lower():
-                logger.info("✅ Redirection vers Pronote reussie!")
-                return session.cookies
+            # Verifier qu'on a bien la page Pronote
+            if 'onload' in resp2.text and 'Start' in resp2.text:
+                logger.info("✅ Page Pronote valide detectee!")
+                return session, resp2
+            else:
+                logger.warning("Page Pronote mais pas de onload/Start")
         
-        # Methode alternative: chercher des liens de connexion
-        logger.info("Recherche de methodes alternatives...")
+        # Verifier s'il y a une erreur dans la reponse
+        soup2 = BeautifulSoup(resp2.text, 'html.parser')
+        error_div = soup2.find(class_=re.compile(r'error|erreur|alert|warning', re.I))
+        if error_div:
+            logger.warning(f"Erreur detectee: {error_div.get_text()[:100]}")
         
-        # Chercher un bouton/lien de connexion
-        links = soup.find_all('a', href=True)
-        for link in links:
-            href = link.get('href', '')
-            text = link.get_text().lower()
-            if 'connect' in text or 'login' in text or 'auth' in href:
-                logger.debug(f"Lien trouve: {text} -> {href}")
+        # Chercher si on doit encore suivre des redirections
+        meta_refresh = soup2.find('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
+        if meta_refresh:
+            content = meta_refresh.get('content', '')
+            logger.info(f"Meta refresh trouve: {content}")
         
-        # Chercher des scripts qui contiennent des URLs d'auth
-        scripts = soup.find_all('script')
-        for script in scripts:
-            if script.string and ('login' in script.string.lower() or 'auth' in script.string.lower()):
-                logger.debug(f"Script interessant trouve")
+        # Verifier les cookies de session
+        logger.info(f"Cookies: {list(session.cookies.keys())}")
         
-        logger.warning("Impossible de trouver le formulaire de connexion standard")
         return None
         
     except Exception as e:
-        logger.error(f"Erreur lors de l'authentification: {e}")
+        logger.error(f"Erreur: {e}")
         import traceback
         traceback.print_exc()
         return None
-
-def custom_ent_77(username, password, pronote_url):
-    """
-    Fonction ENT personnalisee pour Seine-et-Marne
-    Compatible avec pronotepy
-    """
-    cookies = login_ent_seine_et_marne(username, password, pronote_url)
-    if cookies:
-        return cookies
-    raise Exception("Echec de l'authentification ENT Seine-et-Marne")
 
 @app.route('/sync', methods=['POST'])
 def sync_pronote():
@@ -147,40 +184,46 @@ def sync_pronote():
         client = None
         last_error = ""
         
-        # Methode 1: Essayer notre ENT personnalise
+        # Methode 1: Notre ENT personnalise
         try:
-            logger.info(">>> Essai : ENT Seine-et-Marne (custom)")
-            cookies = login_ent_seine_et_marne(username, password, pronote_url)
-            if cookies:
-                # Creer une session avec les cookies
-                client = pronotepy.Client(pronote_url, cookies=cookies)
-                if client.logged_in:
-                    logger.info("✅ CONNECTE via ENT custom!")
+            logger.info(">>> Methode: ENT Seine-et-Marne (scraping)")
+            result = login_ent_seine_et_marne(username, password, pronote_url)
+            
+            if result:
+                session, resp = result
+                # Essayer de creer le client avec la session
+                # On doit extraire les parametres de la page Pronote
+                logger.info("Tentative de creation du client Pronote...")
+                
+                # Parser la page pour extraire les infos de session
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                body = soup.find('body')
+                if body and body.get('onload'):
+                    onload = body.get('onload')
+                    logger.info(f"onload trouve: {onload[:100]}")
+                    
+                    # Le client pronotepy peut etre initialise avec les cookies
+                    client = pronotepy.Client(pronote_url, cookies=session.cookies)
+                    if client.logged_in:
+                        logger.info("✅ Client Pronote cree!")
         except Exception as e:
             last_error = str(e)
-            logger.warning(f"❌ ENT custom: {last_error[:100]}")
+            logger.warning(f"❌ Scraping: {last_error[:100]}")
             client = None
         
-        # Methode 2: Essayer les ENT standards
+        # Methode 2: ENT standards
         if not client or not client.logged_in:
             import pronotepy.ent as ent_module
-            ent_list = []
-            if hasattr(ent_module, 'ent77'):
-                ent_list.append(('ent77', ent_module.ent77))
-            if hasattr(ent_module, 'ile_de_france'):
-                ent_list.append(('ile_de_france', ent_module.ile_de_france))
-            ent_list.append(('Direct', None))
             
-            for ent_name, ent_func in ent_list:
+            for ent_name in ['ent77', 'ile_de_france']:
+                if not hasattr(ent_module, ent_name):
+                    continue
                 try:
-                    logger.info(f">>> Essai : {ent_name}")
-                    if ent_func:
-                        client = pronotepy.Client(pronote_url, username=username, password=password, ent=ent_func)
-                    else:
-                        client = pronotepy.Client(pronote_url, username=username, password=password)
-                    
+                    logger.info(f">>> Methode: {ent_name}")
+                    ent_func = getattr(ent_module, ent_name)
+                    client = pronotepy.Client(pronote_url, username=username, password=password, ent=ent_func)
                     if client.logged_in:
-                        logger.info(f"✅ CONNECTE via {ent_name}!")
+                        logger.info(f"✅ Connecte via {ent_name}")
                         break
                     client = None
                 except Exception as e:
@@ -189,9 +232,9 @@ def sync_pronote():
                     client = None
 
         if not client or not client.logged_in:
-            return jsonify({'error': f'Echec connexion. {last_error[:80]}'}), 401
+            return jsonify({'error': f'Echec. Verifiez vos identifiants. ({last_error[:50]})'}), 401
 
-        # --- DONNEES ---
+        # Recuperation des donnees
         result = {
             'studentData': {
                 'name': client.info.name,
@@ -200,12 +243,9 @@ def sync_pronote():
             },
             'schedule': [[], [], [], [], []],
             'homework': [],
-            'grades': [],
-            'subjectAverages': [],
-            'messages': []
+            'grades': []
         }
 
-        # Emploi du temps
         try:
             today = datetime.now()
             monday = today - timedelta(days=today.weekday())
@@ -219,10 +259,8 @@ def sync_pronote():
                         'color': 'bg-red-500' if l.canceled else 'bg-indigo-500'
                     })
                 result['schedule'][day].sort(key=lambda x: x['time'])
-        except Exception as e:
-            logger.error(f"EDT: {e}")
+        except: pass
 
-        # Devoirs
         try:
             for i, hw in enumerate(client.homework(datetime.now(), datetime.now() + timedelta(days=14))):
                 result['homework'].append({
@@ -230,14 +268,11 @@ def sync_pronote():
                     'subject': hw.subject.name if hw.subject else 'Devoir',
                     'title': hw.description,
                     'dueDate': hw.date.strftime('%d/%m'),
-                    'urgent': (hw.date - datetime.now().date()).days < 2,
                     'done': getattr(hw, 'done', False),
                     'color': 'bg-indigo-500'
                 })
-        except Exception as e:
-            logger.error(f"Devoirs: {e}")
+        except: pass
 
-        # Notes
         try:
             period = client.current_period
             total, count = 0, 0
@@ -252,16 +287,13 @@ def sync_pronote():
                         'grade': val,
                         'max': mx,
                         'date': g.date.strftime('%d/%m'),
-                        'comment': g.comment or '',
                         'average': round((val/mx)*20, 1)
                     })
                 except: pass
             if count > 0:
                 result['studentData']['average'] = round(total/count, 1)
-        except Exception as e:
-            logger.error(f"Notes: {e}")
+        except: pass
 
-        logger.info(f"=== FIN {client.info.name} ===")
         return jsonify(result)
 
     except Exception as e:
@@ -271,37 +303,6 @@ def sync_pronote():
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
-
-@app.route('/debug-ent', methods=['POST'])
-def debug_ent():
-    """Endpoint pour debugger la page de l'ENT"""
-    try:
-        data = request.json
-        url = data.get('url', 'https://0771068t.index-education.net/pronote/eleve.html')
-        
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        
-        resp = session.get(url, allow_redirects=True)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        # Extraire les infos utiles
-        forms = soup.find_all('form')
-        links = soup.find_all('a', href=True)[:20]
-        
-        return jsonify({
-            'final_url': resp.url,
-            'status': resp.status_code,
-            'title': soup.title.string if soup.title else None,
-            'forms_count': len(forms),
-            'forms': [{'action': f.get('action'), 'method': f.get('method')} for f in forms],
-            'links': [{'href': l.get('href'), 'text': l.get_text()[:50]} for l in links],
-            'html_preview': resp.text[:2000]
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     import os
