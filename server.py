@@ -6,6 +6,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 import logging
 import re
 import json
+import datetime
 
 app = Flask(__name__)
 CORS(app)
@@ -15,10 +16,9 @@ logger = logging.getLogger(__name__)
 
 def sync_pronote_clone(username, password, pronote_url):
     session = requests.Session()
-    
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 AVG/143.0.0.0',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'fr-FR,fr;q=0.9',
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache'
@@ -27,7 +27,6 @@ def sync_pronote_clone(username, password, pronote_url):
     try:
         logger.info(f"1. GET {pronote_url}")
         res = session.get(pronote_url, allow_redirects=True)
-        
         soup = BeautifulSoup(res.text, 'html.parser')
         form = soup.find('form')
         
@@ -65,17 +64,7 @@ def sync_pronote_clone(username, password, pronote_url):
                 
             if "pronote" in final_res.url.lower():
                 logger.info("✅ SUCCES : Page Pronote atteinte !")
-                
-                # On essaie d'extraire le nom depuis le HTML
-                data = extract_data(final_res.text, username)
-                
-                # Si le nom n'est pas trouvé, on utilise l'identifiant ENT formaté
-                if data['studentData']['name'] == username:
-                    # Formater "prenom.nom" en "Prenom Nom"
-                    formatted_name = username.split('@')[0].replace('.', ' ').title()
-                    data['studentData']['name'] = formatted_name
-                    
-                return data
+                return extract_data_from_html(final_res.text, username)
                 
         return None
 
@@ -83,7 +72,9 @@ def sync_pronote_clone(username, password, pronote_url):
         logger.error(f"Erreur : {e}")
         return None
 
-def extract_data(html, username):
+def extract_data_from_html(html, username):
+    soup = BeautifulSoup(html, 'html.parser')
+    
     data = {
         'studentData': {'name': username, 'class': 'Classe inconnue', 'average': 0, 'rank': 1, 'totalStudents': 30},
         'schedule': [[], [], [], [], []],
@@ -95,27 +86,71 @@ def extract_data(html, username):
     }
     
     try:
-        # Essayer de trouver le nom dans le titre ou les balises meta
+        # 1. NOM et CLASSE
         title_match = re.search(r"<title>PRONOTE\s*-\s*([^-\n<]+)", html, re.I)
         if title_match:
-            full_name = title_match.group(1).strip()
-            full_name = full_name.replace("ESPACE ÉLÈVE", "").strip()
-            if full_name:
-                data['studentData']['name'] = full_name
+            full_name = title_match.group(1).strip().replace("ESPACE ÉLÈVE", "").strip()
+            if full_name: data['studentData']['name'] = full_name
 
-        # Chercher dans les scripts JS (variables globales)
         script_match = re.search(r"Nom\s*:\s*['\"]([^'\"]+)['\"]", html)
-        if script_match:
-            data['studentData']['name'] = script_match.group(1)
+        if script_match: data['studentData']['name'] = script_match.group(1)
 
-        # Message de succès
+        # 2. EMPLOI DU TEMPS (NOUVEAU !)
+        # On cherche les éléments <li> avec la classe flex-contain
+        # <span class="sr-only">de 9h25 à 10h20 HISTOIRE-GEOGRAPHIE</span>
+        
+        logger.info("Analyse de l'emploi du temps...")
+        
+        cours_items = soup.find_all('li', class_='flex-contain')
+        
+        # Jour actuel (0=Lundi, 6=Dimanche)
+        today_idx = datetime.now().weekday()
+        if today_idx > 4: today_idx = 0 # Si weekend, montrer lundi
+        
+        for li in cours_items:
+            # Chercher l'heure et la matière
+            span_time = li.find('span', class_='sr-only')
+            if span_time:
+                text = span_time.get_text().strip()
+                # Format: "de 9h25 à 10h20 HISTOIRE-GEOGRAPHIE"
+                match = re.search(r"de\s+(\d+h\d+)\s+à\s+(\d+h\d+)\s+(.+)", text, re.I)
+                
+                if match:
+                    start_time = match.group(1)
+                    end_time = match.group(2)
+                    subject = match.group(3).strip()
+                    
+                    # Chercher prof et salle dans les autres <li> fils
+                    details = li.find_all('li')
+                    prof = details[0].get_text().strip() if len(details) > 0 else ""
+                    room = details[1].get_text().strip() if len(details) > 1 else ""
+                    
+                    # Couleur par défaut
+                    color = 'bg-indigo-500'
+                    if 'hist' in subject.lower(): color = 'bg-amber-500'
+                    elif 'math' in subject.lower(): color = 'bg-blue-600'
+                    elif 'fran' in subject.lower(): color = 'bg-pink-500'
+                    elif 'angl' in subject.lower(): color = 'bg-emerald-500'
+                    
+                    # Ajouter au jour actuel
+                    data['schedule'][today_idx].append({
+                        'time': f"{start_time} - {end_time}",
+                        'subject': subject,
+                        'teacher': prof,
+                        'room': room,
+                        'color': color
+                    })
+                    
+        logger.info(f"Cours trouvés pour aujourd'hui: {len(data['schedule'][today_idx])}")
+
+        # 3. Message de succès
         data['messages'].append({
             'id': 1,
             'from': 'Système',
             'subject': 'Connexion Réussie',
             'date': 'Maintenant',
             'unread': True,
-            'content': f"Authentification réussie pour {data['studentData']['name']} ! Les données détaillées sont chiffrées par Pronote."
+            'content': f"Authentification réussie ! Emploi du temps récupéré."
         })
 
         return data
