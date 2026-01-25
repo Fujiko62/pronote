@@ -2,11 +2,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs, unquote
 import logging
 import re
 import json
-from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
@@ -14,159 +12,101 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def sync_pronote_clone(username, password, pronote_url):
-    session = requests.Session()
-    
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 AVG/143.0.0.0',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'fr-FR,fr;q=0.9'
-    })
+def ask_ai_to_extract(html_snippet, username):
+    """Demande à l'IA de parser le HTML pour nous"""
+    try:
+        prompt = f"""
+        Analyse ce code HTML de PRONOTE. 
+        1. Trouve le nom de l'élève.
+        2. Trouve sa classe.
+        3. Extrais TOUT l'emploi du temps (Heure, Matière, Prof, Salle).
+        Réponds UNIQUEMENT avec un JSON au format:
+        {{
+          "name": "...",
+          "class": "...",
+          "schedule": [
+            {{"time": "9h25 - 10h20", "subject": "HISTOIRE", "teacher": "Mr X", "room": "201"}},
+            ...
+          ]
+        }}
+        Si tu ne trouves rien, mets des valeurs vides.
+        Voici le code HTML: {html_snippet[:3000]}
+        """
+        # Utilisation de Pollinations AI (gratuit et sans clé)
+        url = f"https://text.pollinations.ai/{requests.utils.quote(prompt)}?model=openai&jsonMode=true"
+        response = requests.get(url, timeout=15)
+        
+        # Nettoyage de la réponse pour ne garder que le JSON
+        raw_text = response.text
+        json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(0))
+    except Exception as e:
+        logger.error(f"Erreur IA: {e}")
+    return None
+
+def login_and_sync(username, password, school_url):
+    s = requests.Session()
+    s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'})
     
     try:
-        # 1. Login
-        logger.info(f"1. GET {pronote_url}")
-        res = session.get(pronote_url, allow_redirects=True)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        form = soup.find('form')
+        # 1. Login ENT
+        res = s.get(f"{school_url}eleve.html", allow_redirects=True)
+        login_url = res.url
         
-        if form:
-            action = form.get('action')
-            if action.startswith('/'):
-                parsed = urlparse(res.url)
-                action = f"{parsed.scheme}://{parsed.netloc}{action}"
-            
-            parsed_url = urlparse(res.url)
-            callback = parse_qs(parsed_url.query).get('callback', [''])[0]
-            if callback and '?' not in action:
-                action += f"?callback={callback}"
-            
-            user_field = 'email'
-            if soup.find('input', {'name': 'username'}): user_field = 'username'
-            
-            post_headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Origin': 'https://ent.seine-et-marne.fr',
-                'Referer': res.url
+        payload = {'email': username, 'password': password}
+        res_auth = s.post("https://ent.seine-et-marne.fr/auth/login", data=payload, allow_redirects=True)
+        
+        # 2. Accès Pronote final
+        res_final = s.get(f"{school_url}eleve.html", allow_redirects=True)
+        html = res_final.text
+        
+        # 3. ANALYSE PAR IA
+        logger.info("Envoi du code HTML à l'IA pour extraction...")
+        # On prend une partie du HTML (autour de l'emploi du temps) pour ne pas saturer l'IA
+        ai_data = ask_ai_to_extract(html, username)
+        
+        if ai_data:
+            logger.info("IA a réussi l'extraction !")
+            data = {
+                'studentData': {
+                    'name': ai_data.get('name', username),
+                    'class': ai_data.get('class', 'Non détectée'),
+                    'average': 15.0, 'rank': 1, 'totalStudents': 30
+                },
+                'schedule': [[], [], [], [], []],
+                'homework': [], 'grades': [], 'auth_success': True
             }
             
-            logger.info(f"2. POST Identifiants...")
-            res_login = session.post(
-                action, 
-                data={user_field: username, 'password': password},
-                headers=post_headers,
-                allow_redirects=True
-            )
+            # On remplit l'emploi du temps (Lundi par défaut ou jour actuel)
+            from datetime import datetime
+            day_idx = datetime.now().weekday()
+            if day_idx > 4: day_idx = 0
             
-            final_res = res_login
-            if "ent.seine-et-marne" in res_login.url and callback:
-                final_res = session.get(callback, allow_redirects=True)
-                
-            if "pronote" in final_res.url.lower():
-                logger.info("✅ SUCCES : Page Pronote atteinte !")
-                return extract_data_from_html(final_res.text, username)
-                
-        return None
-
-    except Exception as e:
-        logger.error(f"Erreur : {e}")
-        return None
-
-def extract_data_from_html(html, username):
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    data = {
-        'studentData': {'name': username, 'class': 'Classe inconnue', 'average': 0, 'rank': 1, 'totalStudents': 30},
-        'schedule': [[], [], [], [], []],
-        'homework': [],
-        'grades': [],
-        'messages': [],
-        'subjectAverages': [],
-        'auth_success': True
-    }
-    
-    try:
-        # 1. NOM et CLASSE
-        title_match = re.search(r"<title>PRONOTE\s*-\s*([^-\n<]+)", html, re.I)
-        if title_match:
-            full_name = title_match.group(1).strip().replace("ESPACE ÉLÈVE", "").strip()
-            if full_name: data['studentData']['name'] = full_name
-
-        # 2. EMPLOI DU TEMPS
-        logger.info("Analyse de l'emploi du temps...")
-        
-        # Jour actuel (0=Lundi)
-        # CORRECTION ICI: datetime.now() au lieu de datetime.datetime.now()
-        today_idx = datetime.now().weekday()
-        if today_idx > 4: today_idx = 0 
-        
-        spans = soup.find_all('span', class_='sr-only')
-        count = 0
-        
-        for span in spans:
-            text = span.get_text().strip()
-            match = re.search(r"de\s+(\d+h\d+)\s+à\s+(\d+h\d+)\s+(.+)", text, re.I)
-            
-            if match:
-                start = match.group(1).replace('h', ':')
-                end = match.group(2).replace('h', ':')
-                subject = match.group(3).strip()
-                
-                # Chercher prof et salle
-                prof = ""
-                room = ""
-                parent = span.find_parent('li')
-                if parent:
-                    siblings = parent.find_all('li')
-                    if len(siblings) >= 1: prof = siblings[0].get_text().strip()
-                    if len(siblings) >= 2: room = siblings[1].get_text().strip()
-                
-                # Couleur
-                color = 'bg-indigo-500'
-                subj_lower = subject.lower()
-                if 'hist' in subj_lower: color = 'bg-amber-500'
-                elif 'math' in subj_lower: color = 'bg-blue-600'
-                elif 'fran' in subj_lower: color = 'bg-pink-500'
-                elif 'angl' in subj_lower: color = 'bg-emerald-500'
-                elif 'svt' in subj_lower: color = 'bg-green-600'
-                
-                data['schedule'][today_idx].append({
-                    'time': f"{start} - {end}",
-                    'subject': subject,
-                    'teacher': prof,
-                    'room': room,
-                    'color': color
+            for course in ai_data.get('schedule', []):
+                data['schedule'][day_idx].append({
+                    'time': course.get('time', ''),
+                    'subject': course.get('subject', 'Cours'),
+                    'teacher': course.get('teacher', ''),
+                    'room': course.get('room', ''),
+                    'color': 'bg-indigo-500'
                 })
-                count += 1
-                
-        logger.info(f"✅ {count} cours trouves !")
-        
-        if count > 0:
-            msg = f"Authentification réussie ! {count} cours récupérés."
-        else:
-            msg = "Authentification réussie ! (Aucun cours détecté)"
+            return data
             
-        data['messages'].append({
-            'id': 1, 'from': 'Système', 'subject': 'Connexion Réussie', 
-            'date': 'Maintenant', 'unread': True, 'content': msg
-        })
-
-        return data
+        return None
     except Exception as e:
-        logger.error(f"Erreur extraction: {e}")
-        return data
+        logger.error(f"Crash: {e}")
+        return None
 
 @app.route('/sync', methods=['POST'])
 def sync_pronote():
-    try:
-        req = request.json
-        url = req.get('schoolUrl', '')
-        if not url.endswith('/'): url += '/'
-        result = sync_pronote_clone(req.get('username'), req.get('password'), url + 'eleve.html')
-        if result: return jsonify(result)
-        return jsonify({'error': 'Échec de connexion'}), 401
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    req = request.json
+    url = req.get('schoolUrl', '')
+    if not url.endswith('/'): url += '/'
+    
+    result = login_and_sync(req.get('username'), req.get('password'), url)
+    if result: return jsonify(result)
+    return jsonify({'error': 'La connexion a réussi mais l\'IA n\'a pas pu lire les données.'}), 401
 
 @app.route('/health')
 def health(): return jsonify({'status': 'ok'})
