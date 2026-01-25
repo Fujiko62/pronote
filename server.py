@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 import logging
 import re
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -15,23 +16,33 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 def login_ent_77(username, password, pronote_url):
-    """Authentification ENT Seine-et-Marne"""
+    """Authentification ENT Seine-et-Marne renforcee"""
     
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cache-Control': 'max-age=0',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1'
     })
     
-    logger.info("=== AUTH ENT 77 ===")
+    logger.info("=== AUTH ENT 77 RENFORCEE ===")
     
     try:
-        # Etape 1: Aller sur Pronote
+        # Etape 1: Acces Pronote
         resp1 = session.get(pronote_url, allow_redirects=True)
+        logger.info(f"1. Acces initial: {resp1.url}")
         
         soup = BeautifulSoup(resp1.text, 'html.parser')
         form = soup.find('form')
         if not form:
+            logger.error("Pas de formulaire!")
             return None
         
         action = form.get('action', '')
@@ -41,57 +52,66 @@ def login_ent_77(username, password, pronote_url):
         # Etape 2: Login
         login_url = f"{action}?callback={callback}" if callback else action
         
+        # Headers specifiques pour le POST
+        post_headers = {
+            'Origin': 'https://ent.seine-et-marne.fr',
+            'Referer': resp1.url,
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        
+        logger.info(f"2. POST {login_url[:60]}...")
+        
         resp2 = session.post(
             login_url,
             data={'email': username, 'password': password},
             allow_redirects=True,
-            headers={'Referer': resp1.url, 'Origin': 'https://ent.seine-et-marne.fr'}
+            headers=post_headers
         )
         
-        logger.info(f"URL finale: {resp2.url}")
+        logger.info(f"   Status: {resp2.status_code}")
+        logger.info(f"   URL: {resp2.url}")
         
+        # Si on est redirige vers Pronote avec identifiant
         if 'pronote' in resp2.url.lower() and 'identifiant=' in resp2.url:
+            logger.info("   ✅ Redirection Pronote OK")
+            
+            # Verifier le contenu de la page
             soup2 = BeautifulSoup(resp2.text, 'html.parser')
             body = soup2.find('body')
             
-            if body and body.get('onload'):
-                onload = body.get('onload')
-                match = re.search(r"Start\s*\(\s*\{([^}]+)\}", onload)
-                if match:
-                    params = match.group(1)
-                    h = re.search(r"h[:\s]*['\"]?(\d+)", params)
-                    e = re.search(r"e[:\s]*['\"]([^'\"]+)['\"]", params)
-                    f = re.search(r"f[:\s]*['\"]([^'\"]+)['\"]", params)
+            if body:
+                onload = body.get('onload', '')
+                if 'Start' in onload:
+                    match = re.search(r"Start\s*\(\s*\{([^}]+)\}", onload)
+                    if match:
+                        logger.info("   ✅ Parametres Start trouves!")
+                        params = match.group(1)
+                        h = re.search(r"h[:\s]*['\"]?(\d+)", params)
+                        e = re.search(r"e[:\s]*['\"]([^'\"]+)['\"]", params)
+                        f = re.search(r"f[:\s]*['\"]([^'\"]+)['\"]", params)
+                        
+                        if h and e and f:
+                            return {
+                                'url': resp2.url,
+                                'h': h.group(1),
+                                'e': e.group(1),
+                                'f': f.group(1),
+                                'session': session
+                            }
+                else:
+                    logger.warning(f"   ⚠️ Page Pronote invalide (taille: {len(resp2.text)})")
+                    logger.warning(f"   Body: {body.get_text()[:200]}")
                     
-                    if h and e and f:
-                        logger.info(f"✅ Auth OK: h={h.group(1)}")
-                        return {
-                            'url': resp2.url,
-                            'html': resp2.text,
-                            'h': h.group(1),
-                            'e': e.group(1),
-                            'f': f.group(1),
-                            'session': session,
-                            'cookies': dict(session.cookies)
-                        }
+                    # Peut-etre une redirection JS ?
+                    script = soup2.find('script')
+                    if script and 'location.replace' in str(script):
+                        logger.info("   🔄 Redirection JS detectee")
+                        # TODO: Gerer redirection JS si besoin
+        
         return None
     except Exception as e:
         logger.error(f"Erreur: {e}")
         return None
-
-class CustomClient(pronotepy.Client):
-    """Client Pronote personnalise qui accepte une session pre-authentifiee"""
-    
-    def __init__(self, pronote_url, auth_data):
-        # On override completement l'init pour utiliser notre session
-        self.auth_data = auth_data
-        
-        # Appeler le parent avec les credentials ENT
-        super().__init__(
-            pronote_url,
-            username=auth_data['e'],
-            password=auth_data['f']
-        )
 
 @app.route('/sync', methods=['POST'])
 def sync_pronote():
@@ -112,78 +132,26 @@ def sync_pronote():
         
         logger.info(f"=== SYNCHRO {username} ===")
         
-        # Authentification ENT
         auth = login_ent_77(username, password, pronote_url)
         
         if not auth:
-            return jsonify({'error': 'Echec authentification ENT. Verifiez email/mot de passe.'}), 401
+            return jsonify({'error': 'Echec auth ENT. Verifiez identifiants.'}), 401
         
         logger.info("Auth ENT OK, creation client Pronote...")
         
-        # Utiliser l'URL AVEC l'identifiant
-        # C'est la cle: on utilise l'URL complete retournee par l'ENT
+        # Creer client avec les credentials ENT
         try:
-            # L'URL contient deja ?identifiant=xxx
-            # On doit utiliser e et f comme credentials
             client = pronotepy.Client(
-                auth['url'],  # URL avec ?identifiant=xxx
+                auth['url'],
                 username=auth['e'],
                 password=auth['f']
             )
         except Exception as e:
-            logger.warning(f"Tentative 1 echouee: {e}")
-            
-            # Essayer avec l'URL de base + credentials ENT
-            try:
-                # Extraire l'identifiant
-                parsed = urlparse(auth['url'])
-                identifiant = parse_qs(parsed.query).get('identifiant', [''])[0]
-                base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-                
-                logger.info(f"Tentative 2: {base_url} avec identifiant={identifiant[:10]}...")
-                
-                # Creer une session avec les cookies ENT
-                import pronotepy.pronoteAPI as pronoteAPI
-                
-                # Monkey-patch pour injecter nos cookies
-                original_init = pronoteAPI.ClientBase.__init__
-                
-                def patched_init(self, pronote_url, *args, **kwargs):
-                    # Injecter la session avec cookies
-                    self._session = auth['session']
-                    original_init(self, pronote_url, *args, **kwargs)
-                
-                # Ce n'est pas ideal mais ca peut marcher...
-                # En fait, essayons autre chose
-                
-                # Le plus simple: utiliser directement les donnees qu'on a deja!
-                # On a le HTML de la page Pronote, on peut l'utiliser
-                
-                raise Exception("Voir methode alternative")
-                
-            except Exception as e2:
-                logger.warning(f"Tentative 2 echouee: {e2}")
+            logger.error(f"Erreur client: {e}")
+            return jsonify({'error': 'Erreur connexion Pronote'}), 401
         
-        # Si pronotepy ne marche pas, on extrait les donnees nous-memes
-        # depuis le HTML qu'on a deja!
-        if not client or not client.logged_in:
-            logger.info("Utilisation methode alternative...")
-            
-            # On a deja la page Pronote dans auth['html']
-            # Mais pour les donnees, il faut faire des requetes API
-            # C'est plus complexe...
-            
-            # Pour l'instant, retournons au moins les infos de base
-            # qu'on peut extraire
-            
-            return jsonify({
-                'error': 'Authentification ENT OK mais pronotepy incompatible. Utilisez la saisie manuelle.',
-                'debug': {
-                    'auth_success': True,
-                    'pronote_url': auth['url'],
-                    'session_id': auth['h']
-                }
-            }), 401
+        if not client.logged_in:
+            return jsonify({'error': 'Non connecte a Pronote'}), 401
         
         logger.info(f"✅ CONNECTE: {client.info.name}")
         
@@ -192,7 +160,9 @@ def sync_pronote():
             'studentData': {
                 'name': client.info.name,
                 'class': client.info.class_name,
-                'average': 0
+                'average': 0,
+                'rank': 1,
+                'totalStudents': 30
             },
             'schedule': [[], [], [], [], []],
             'homework': [],
@@ -203,7 +173,8 @@ def sync_pronote():
 
         # EDT
         try:
-            monday = datetime.now() - timedelta(days=datetime.now().weekday())
+            today = datetime.now()
+            monday = today - timedelta(days=today.weekday())
             for day in range(5):
                 for l in client.lessons(monday + timedelta(days=day)):
                     result['schedule'][day].append({
@@ -211,10 +182,12 @@ def sync_pronote():
                         'subject': l.subject.name if l.subject else 'Cours',
                         'teacher': l.teacher_name or '',
                         'room': l.classroom or '',
-                        'color': 'bg-red-500' if l.canceled else 'bg-indigo-500'
+                        'color': 'bg-indigo-500'
                     })
                 result['schedule'][day].sort(key=lambda x: x['time'])
-        except: pass
+            logger.info(f"EDT: {sum(len(d) for d in result['schedule'])} cours")
+        except Exception as e:
+            logger.error(f"EDT: {e}")
 
         # Devoirs
         try:
@@ -227,7 +200,9 @@ def sync_pronote():
                     'done': getattr(hw, 'done', False),
                     'color': 'bg-indigo-500'
                 })
-        except: pass
+            logger.info(f"Devoirs: {len(result['homework'])}")
+        except Exception as e:
+            logger.error(f"Devoirs: {e}")
 
         # Notes
         try:
@@ -249,7 +224,9 @@ def sync_pronote():
                 except: pass
             if count > 0:
                 result['studentData']['average'] = round(total/count, 1)
-        except: pass
+            logger.info(f"Notes: {len(result['grades'])}")
+        except Exception as e:
+            logger.error(f"Notes: {e}")
 
         return jsonify(result)
 
