@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 import logging
 import re
-import functools
+import socket
 
 app = Flask(__name__)
 CORS(app)
@@ -15,10 +15,9 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- UTILITAIRES ENT ---
+# --- UTILITAIRES ---
 
 def get_ent_function(name):
-    """Recupere une fonction ENT sans planter"""
     try:
         import pronotepy.ent as ent_module
         if hasattr(ent_module, name):
@@ -26,58 +25,103 @@ def get_ent_function(name):
     except: pass
     return None
 
-# --- METHODE 1: SCRAPING CAS (Pour ENT 77 Web) ---
+def check_dns(hostname):
+    try:
+        socket.gethostbyname(hostname)
+        return True
+    except:
+        return False
+
+# --- SCRAPING CAS ---
 
 def login_cas_scraping(username, password, pronote_url):
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     })
+    
+    logger.info("--- Debut Scraping ---")
     
     try:
         # 1. Acces Pronote
-        resp = session.get(pronote_url, allow_redirects=True)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        form = soup.find('form')
-        if not form: return None
+        logger.info(f"GET {pronote_url}")
+        resp = session.get(pronote_url, allow_redirects=True, timeout=10)
+        logger.info(f"URL finale: {resp.url}")
         
-        # 2. Login
-        action = form.get('action', '')
-        parsed = urlparse(resp.url)
-        callback = parse_qs(parsed.query).get('callback', [''])[0]
-        login_url = f"{action}?callback={callback}" if callback else action
-        
-        resp = session.post(
-            login_url,
-            data={'email': username, 'password': password},
-            headers={'Referer': resp.url, 'Origin': 'https://ent.seine-et-marne.fr'}
-        )
-        
-        # 3. Extraction Session
-        if 'identifiant=' in resp.url:
+        # Si on est redirige vers l'ENT
+        if 'ent' in resp.url:
             soup = BeautifulSoup(resp.text, 'html.parser')
-            body = soup.find('body')
-            if body and body.get('onload'):
-                onload = body.get('onload')
-                match = re.search(r"Start\s*\(\s*\{([^}]+)\}", onload)
-                if match:
-                    params = match.group(1)
-                    h = re.search(r"h[:\s]*['\"]?(\d+)", params)
-                    e = re.search(r"e[:\s]*['\"]([^'\"]+)['\"]", params)
-                    f = re.search(r"f[:\s]*['\"]([^'\"]+)['\"]", params)
-                    if h and e and f:
-                        return {
-                            'url': resp.url,
-                            'h': h.group(1),
-                            'e': e.group(1),
-                            'f': f.group(1)
-                        }
+            form = soup.find('form')
+            
+            if form:
+                action = form.get('action', '')
+                logger.info(f"Formulaire trouve: {action}")
+                
+                # Gerer l'URL d'action relative
+                if action.startswith('/'):
+                    parsed = urlparse(resp.url)
+                    action = f"{parsed.scheme}://{parsed.netloc}{action}"
+                
+                # Garder le callback
+                parsed_orig = urlparse(resp.url)
+                callback = parse_qs(parsed_orig.query).get('callback', [''])[0]
+                if callback and '?' not in action:
+                    action += f"?callback={callback}"
+                
+                # Chercher les noms des champs
+                user_field = 'email'
+                pass_field = 'password'
+                
+                # Si input name="username" existe
+                if soup.find('input', {'name': 'username'}): user_field = 'username'
+                if soup.find('input', {'name': 'login'}): user_field = 'login'
+                if soup.find('input', {'name': 'user'}): user_field = 'user'
+                
+                logger.info(f"Champs identifies: {user_field} / {pass_field}")
+                
+                # POST
+                data = {user_field: username, pass_field: password}
+                logger.info(f"POST {action}")
+                
+                resp2 = session.post(
+                    action,
+                    data=data,
+                    allow_redirects=True,
+                    headers={'Referer': resp.url}
+                )
+                
+                logger.info(f"Reponse POST: {resp2.status_code} - {resp2.url}")
+                
+                # Verification Pronote
+                if 'pronote' in resp2.url.lower():
+                    # Chercher les params de session
+                    if 'identifiant=' in resp2.url:
+                        logger.info("✅ URL avec identifiant detectee!")
+                        # On a reussi!
+                        # On peut extraire h, e, f du HTML
+                        soup2 = BeautifulSoup(resp2.text, 'html.parser')
+                        body = soup2.find('body')
+                        if body and body.get('onload'):
+                            onload = body.get('onload')
+                            match = re.search(r"Start\s*\(\s*\{([^}]+)\}", onload)
+                            if match:
+                                params = match.group(1)
+                                h = re.search(r"h[:\s]*['\"]?(\d+)", params)
+                                e = re.search(r"e[:\s]*['\"]([^'\"]+)['\"]", params)
+                                f = re.search(r"f[:\s]*['\"]([^'\"]+)['\"]", params)
+                                if h and e and f:
+                                    return {
+                                        'url': resp2.url,
+                                        'h': h.group(1),
+                                        'e': e.group(1),
+                                        'f': f.group(1)
+                                    }
     except Exception as e:
-        logger.error(f"Scraping error: {e}")
+        logger.error(f"Erreur scraping: {e}")
+    
     return None
 
-# --- ROUTE SYNC ---
+# --- ROUTE ---
 
 @app.route('/sync', methods=['POST'])
 def sync_pronote():
@@ -87,73 +131,63 @@ def sync_pronote():
         username = data.get('username', '').strip()
         password = data.get('password', '').strip()
         
-        if not all([school_url, username, password]):
-            return jsonify({'error': 'Parametres manquants'}), 400
-            
-        # Detecter si c'est une URL mobile
-        is_mobile = 'mobile' in school_url
-        
         if 'eleve.html' in school_url:
             base_url = school_url.split('eleve.html')[0]
         else:
             base_url = school_url if school_url.endswith('/') else school_url + '/'
             
-        pronote_url = base_url + ('mobile.eleve.html' if is_mobile else 'eleve.html')
+        pronote_url = base_url + 'eleve.html'
         
-        logger.info(f"=== SYNCHRO {username} ({'Mobile' if is_mobile else 'Web'}) ===")
+        logger.info(f"=== SYNCHRO {username} ===")
         
         client = None
         
-        # --- STRATEGIE 1: SCRAPING (Web seulement) ---
-        if not is_mobile:
-            logger.info(">>> Strategie 1: Scraping CAS")
-            auth = login_cas_scraping(username, password, pronote_url)
-            if auth:
-                try:
-                    client = pronotepy.Client(auth['url'], username=auth['e'], password=auth['f'])
-                    if client.logged_in:
-                        logger.info("✅ CONNECTE via Scraping")
-                except Exception as e:
-                    logger.warning(f"Echec client scraping: {e}")
-
-        # --- STRATEGIE 2: ENT PRONOTEPY ---
+        # 1. SCRAPING
+        logger.info(">>> Strategie 1: Scraping")
+        auth = login_cas_scraping(username, password, pronote_url)
+        
+        if auth:
+            try:
+                logger.info("Auth reussie, creation client...")
+                client = pronotepy.Client(auth['url'], username=auth['e'], password=auth['f'])
+            except Exception as e:
+                logger.warning(f"Echec client scraping: {e}")
+        
+        # 2. ENT STANDARD
         if not client:
-            logger.info(">>> Strategie 2: ENT Pronotepy")
-            ent_to_try = ['ent77', 'ent_77', 'ile_de_france']
+            logger.info(">>> Strategie 2: ENT Standard")
             
-            for ent_name in ent_to_try:
-                ent_func = get_ent_function(ent_name)
-                if not ent_func: continue
-                
-                try:
-                    logger.info(f"Essai {ent_name}...")
-                    client = pronotepy.Client(pronote_url, username=username, password=password, ent=ent_func)
-                    if client.logged_in:
-                        logger.info(f"✅ CONNECTE via {ent_name}")
-                        break
-                    client = None
-                except Exception as e:
-                    logger.warning(f"Echec {ent_name}: {e}")
+            # Verifier DNS avant
+            if not check_dns('ent77.seine-et-marne.fr'):
+                logger.warning("⚠️ Impossible de resoudre ent77.seine-et-marne.fr")
+            
+            ent_list = ['ent77', 'ent_77', 'ile_de_france']
+            for name in ent_list:
+                func = get_ent_function(name)
+                if func:
+                    try:
+                        logger.info(f"Essai {name}...")
+                        client = pronotepy.Client(pronote_url, username=username, password=password, ent=func)
+                        if client.logged_in:
+                            logger.info("✅ CONNECTE")
+                            break
+                        client = None
+                    except Exception as e:
+                        logger.warning(f"Echec {name}: {e}")
 
-        # --- STRATEGIE 3: DIRECT ---
+        # 3. DIRECT
         if not client:
             logger.info(">>> Strategie 3: Direct")
             try:
                 client = pronotepy.Client(pronote_url, username=username, password=password)
-                if client.logged_in:
-                    logger.info("✅ CONNECTE Direct")
             except: pass
 
         if not client or not client.logged_in:
-            return jsonify({'error': 'Echec connexion. Verifiez vos identifiants.'}), 401
+            return jsonify({'error': 'Echec connexion. Verifiez identifiants ou reessayez.'}), 401
 
-        # --- RECUPERATION DONNEES ---
+        # DATA
         result = {
-            'studentData': {
-                'name': client.info.name,
-                'class': client.info.class_name,
-                'average': 0
-            },
+            'studentData': {'name': client.info.name, 'class': client.info.class_name, 'average': 0},
             'schedule': [[], [], [], [], []],
             'homework': [],
             'grades': []
@@ -187,27 +221,6 @@ def sync_pronote():
                     'color': 'bg-indigo-500'
                 })
         except: pass
-
-        # Notes (Web seulement)
-        if not is_mobile:
-            try:
-                period = client.current_period
-                total, count = 0, 0
-                for g in period.grades[:20]:
-                    val = float(g.grade.replace(',', '.'))
-                    mx = float(g.out_of.replace(',', '.'))
-                    total += (val/mx)*20
-                    count += 1
-                    result['grades'].append({
-                        'subject': g.subject.name,
-                        'grade': val,
-                        'max': mx,
-                        'date': g.date.strftime('%d/%m'),
-                        'average': round((val/mx)*20, 1)
-                    })
-                if count > 0:
-                    result['studentData']['average'] = round(total/count, 1)
-            except: pass
 
         return jsonify(result)
 
