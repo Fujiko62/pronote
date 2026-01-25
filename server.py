@@ -9,17 +9,19 @@ import functools
 app = Flask(__name__)
 CORS(app)
 
-# Configuration logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def get_ent_by_name(name):
-    """Récupère une fonction ENT par son nom sans planter"""
-    try:
-        if hasattr(pronotepy.ent, name):
-            return getattr(pronotepy.ent, name)
-    except: pass
-    return None
+def get_ent_name_safe(ent):
+    """Recupere le nom de l'ENT sans faire planter le serveur"""
+    if ent is None:
+        return "Connexion Directe"
+    if hasattr(ent, '__name__'):
+        return ent.__name__
+    if isinstance(ent, functools.partial):
+        # C'est ici que ca plantait avant, maintenant on gere le cas
+        return "ENT_Specifique (Partial)"
+    return str(ent)
 
 @app.route('/sync', methods=['POST'])
 def sync_pronote():
@@ -32,69 +34,62 @@ def sync_pronote():
         if not all([school_url, username, password]):
             return jsonify({'error': 'Parametres manquants'}), 400
         
-        # Nettoyage de l'URL
+        # Nettoyage URL
         if 'eleve.html' in school_url:
             school_url = school_url.split('eleve.html')[0]
         if not school_url.endswith('/'):
             school_url += '/'
         pronote_url = school_url + 'eleve.html'
         
-        logger.info(f"Tentative de synchronisation pour {username} sur {pronote_url}")
+        logger.info(f"Tentative de connexion pour {username}")
+
+        # --- SELECTION DES ENT ---
+        # On cherche specifiquement ceux du 77 et IDF
+        ent_candidates = []
         
+        # 1. Chercher ent77 ou ent_77 (Seine-et-Marne)
+        if hasattr(pronotepy.ent, 'ent77'):
+            ent_candidates.append(getattr(pronotepy.ent, 'ent77'))
+        elif hasattr(pronotepy.ent, 'ent_77'):
+            ent_candidates.append(getattr(pronotepy.ent, 'ent_77'))
+            
+        # 2. Chercher ile_de_france
+        if hasattr(pronotepy.ent, 'ile_de_france'):
+            ent_candidates.append(getattr(pronotepy.ent, 'ile_de_france'))
+            
+        # 3. Ajouter la connexion directe (fallback)
+        ent_candidates.append(None)
+
         client = None
         
-        # Liste des ENT à tester (noms exacts dans pronotepy)
-        # On met en premier ceux du 77 et IDF
-        ent_names_to_try = [
-            'ent_77', 
-            'ile_de_france', 
-            'monlycee_net', 
-            'paris_classe_numerique',
-            'educonnect',
-            'cas_agora06',
-            'ent_auvergnerhonealpes',
-            'ent_essonne',
-            'ent_somme'
-        ]
-
-        # 1. Tester les ENT spécifiques
-        for ent_name in ent_names_to_try:
-            ent_func = get_ent_by_name(ent_name)
-            if not ent_func:
-                continue
+        for ent in ent_candidates:
+            ent_name = get_ent_name_safe(ent)
+            try:
+                logger.info(f"Essai avec : {ent_name}...")
+                if ent:
+                    client = pronotepy.Client(pronote_url, username=username, password=password, ent=ent)
+                else:
+                    client = pronotepy.Client(pronote_url, username=username, password=password)
                 
-            try:
-                logger.info(f"Essai avec ENT: {ent_name}...")
-                client = pronotepy.Client(pronote_url, username=username, password=password, ent=ent_func)
                 if client.logged_in:
-                    logger.info(f"✅ Connecte avec succes via {ent_name}")
+                    logger.info(f"✅ CONNECTE via {ent_name}!")
                     break
-                client = None
             except Exception as e:
-                logger.warning(f"❌ Echec {ent_name}: {str(e)[:50]}")
+                logger.warning(f"❌ Echec {ent_name}: {str(e)[:100]}")
                 client = None
-
-        # 2. Si echec, tester sans ENT (Direct)
-        if not client:
-            try:
-                logger.info("Essai connexion DIRECTE (sans ENT)...")
-                client = pronotepy.Client(pronote_url, username=username, password=password)
-                if client.logged_in:
-                    logger.info("✅ Connecte avec succes en DIRECT")
-            except Exception as e:
-                logger.warning(f"❌ Echec Direct: {str(e)[:50]}")
 
         if not client or not client.logged_in:
-            return jsonify({'error': 'Connexion impossible. Verifiez identifiant/mot de passe.'}), 401
+            return jsonify({'error': 'Echec de connexion. Verifiez vos identifiants ou l\'URL.'}), 401
 
         # --- RECUPERATION DES DONNEES ---
+        
         result = {
             'studentData': {
                 'name': client.info.name,
                 'class': client.info.class_name,
                 'average': 0,
                 'rank': 1,
-                'totalStudents': 28
+                'totalStudents': 30
             },
             'schedule': [[], [], [], [], []],
             'homework': [],
@@ -135,32 +130,54 @@ def sync_pronote():
                     'color': 'bg-indigo-500'
                 })
         except Exception as e:
-            logger.error(f"Erreur Devoirs: {e}")
+             logger.error(f"Erreur Devoirs: {e}")
 
-        # Notes
+        # Notes et Moyenne
         try:
             period = client.current_period
             grades = sorted(period.grades, key=lambda g: g.date, reverse=True)
-            for g in grades[:20]:
-                val = float(g.grade.replace(',', '.'))
-                mx = float(g.out_of.replace(',', '.'))
-                result['grades'].append({
-                    'subject': g.subject.name,
-                    'grade': val,
-                    'max': mx,
-                    'date': g.date.strftime('%d/%m'),
-                    'comment': g.comment or '',
-                    'average': val
-                })
+            total = 0
+            count = 0
             
-            # Moyenne generale
-            if period.overall_average:
-                result['studentData']['average'] = float(period.overall_average.replace(',', '.'))
-                
-        except Exception as e:
-            logger.error(f"Erreur Notes: {e}")
+            for g in grades[:20]:
+                try:
+                    val = float(g.grade.replace(',', '.'))
+                    mx = float(g.out_of.replace(',', '.'))
+                    normalized = (val / mx) * 20
+                    total += normalized
+                    count += 1
+                    
+                    result['grades'].append({
+                        'subject': g.subject.name,
+                        'grade': val,
+                        'max': mx,
+                        'date': g.date.strftime('%d/%m'),
+                        'comment': g.comment or '',
+                        'average': round(normalized, 1)
+                    })
+                except: pass
+            
+            if count > 0:
+                result['studentData']['average'] = round(total / count, 1)
 
-        logger.info(f"✅ Synchro terminee pour {client.info.name}")
+            # Moyennes matieres
+            for avg in period.averages:
+                try:
+                    student_avg = float(avg.student.replace(',', '.')) if avg.student else 0
+                    class_avg = float(avg.class_average.replace(',', '.')) if avg.class_average else 0
+                    result['subjectAverages'].append({
+                        'subject': avg.subject.name,
+                        'average': student_avg,
+                        'classAvg': class_avg,
+                        'color': 'bg-indigo-500',
+                        'icon': 'fa-book'
+                    })
+                except: pass
+
+        except Exception as e:
+             logger.error(f"Erreur Notes: {e}")
+
+        logger.info(f"Synchro terminee pour {client.info.name}")
         return jsonify(result)
 
     except Exception as e:
@@ -169,9 +186,6 @@ def sync_pronote():
 
 @app.route('/health')
 def health(): return jsonify({'status': 'ok'})
-
-@app.route('/')
-def home(): return "Pronote Sync Server Running"
 
 if __name__ == '__main__':
     import os
