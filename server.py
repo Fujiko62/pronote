@@ -1,29 +1,49 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pronotepy
-from pronotepy.ent import *
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)
 
-# Liste des ENT a essayer pour Ile-de-France / Seine-et-Marne
-ENT_LIST = [
-    None,  # Connexion directe (sans ENT)
-    ile_de_france,
-    ent_creactif,
-    paris_classe_numerique,
-    monlycee_net,
-    ent_somme,
-    ent_mayotte,
-    laclasse_lyon,
-    laclasse_educonnect,
-    eclat_bfc,
-    occitanie_montpellier,
-    cas_agora06,
-    ent_94,
-    ent_77,
-]
+def get_available_ents():
+    """Recupere les ENT disponibles dans pronotepy"""
+    ent_list = [None]  # Connexion directe d'abord
+    
+    try:
+        import pronotepy.ent as ent_module
+        
+        # Liste des ENT a essayer
+        ent_names = [
+            'ile_de_france',
+            'paris_classe_numerique', 
+            'monlycee_net',
+            'ent_somme',
+            'ac_reunion',
+            'ac_reims',
+            'occitanie_montpellier',
+            'cas_agora06',
+            'eclat_bfc',
+            'laclasse_lyon',
+            'ent_mayotte',
+            'ent_hdf',
+            'ent_var',
+            'atrium_sud',
+            'ac_orleans_tours',
+            'ac_poitiers',
+            'ac_rennes',
+            'neoconnect_guadeloupe',
+            'pronote_hubeduconnect',
+        ]
+        
+        for name in ent_names:
+            if hasattr(ent_module, name):
+                ent_list.append(getattr(ent_module, name))
+                
+    except Exception as e:
+        print(f"Erreur chargement ENT: {e}")
+    
+    return ent_list
 
 @app.route('/sync', methods=['POST'])
 def sync_pronote():
@@ -52,9 +72,12 @@ def sync_pronote():
         
         client = None
         used_ent = None
+        ent_list = get_available_ents()
+        
+        print(f"ENT disponibles: {len(ent_list)}")
         
         # Essayer chaque ENT
-        for ent in ENT_LIST:
+        for ent in ent_list:
             ent_name = ent.__name__ if ent else "Direct (sans ENT)"
             try:
                 print(f"  Essai: {ent_name}...")
@@ -71,12 +94,13 @@ def sync_pronote():
                     print(f"  ❌ Echec {ent_name}")
                     client = None
             except Exception as e:
-                print(f"  ❌ Erreur {ent_name}: {str(e)[:50]}")
+                error_msg = str(e)[:80]
+                print(f"  ❌ Erreur {ent_name}: {error_msg}")
                 client = None
                 continue
         
         if not client or not client.logged_in:
-            return jsonify({'error': 'Impossible de se connecter. Verifiez vos identifiants ou contactez le support.'}), 401
+            return jsonify({'error': 'Impossible de se connecter. Verifiez vos identifiants.'}), 401
         
         print(f"\n{'='*60}")
         print(f"CONNECTE!")
@@ -104,11 +128,9 @@ def sync_pronote():
         colors = {
             'math': 'bg-indigo-500',
             'francais': 'bg-pink-500',
-            'français': 'bg-pink-500',
             'anglais': 'bg-blue-500',
             'histoire': 'bg-amber-500',
             'geo': 'bg-amber-500',
-            'geographie': 'bg-amber-500',
             'svt': 'bg-green-500',
             'physique': 'bg-violet-500',
             'chimie': 'bg-violet-500',
@@ -119,8 +141,6 @@ def sync_pronote():
             'arts': 'bg-fuchsia-500',
             'espagnol': 'bg-red-500',
             'allemand': 'bg-yellow-500',
-            'latin': 'bg-emerald-500',
-            'grec': 'bg-emerald-500'
         }
         
         # EMPLOI DU TEMPS
@@ -149,13 +169,9 @@ def sync_pronote():
                             'color': color
                         }
                         
-                        # Ajouter info prof absent si applicable
                         if hasattr(lesson, 'canceled') and lesson.canceled:
                             course_info['canceled'] = True
-                            course_info['subject'] = f"[ANNULÉ] {subj}"
-                        
-                        if hasattr(lesson, 'status') and lesson.status:
-                            course_info['status'] = lesson.status
+                            course_info['subject'] = f"[ANNULE] {subj}"
                         
                         result['schedule'][day].append(course_info)
                 except Exception as e:
@@ -237,7 +253,6 @@ def sync_pronote():
             if count > 0:
                 result['studentData']['average'] = round(total / count, 1)
             
-            # Moyennes par matiere
             for subj, grades_list in subject_grades.items():
                 color = 'bg-indigo-500'
                 for k, c in colors.items():
@@ -257,24 +272,6 @@ def sync_pronote():
             print(f"  ✅ {len(result['grades'])} notes, moyenne: {result['studentData']['average']}")
         except Exception as e:
             print(f"  ❌ Erreur notes: {e}")
-        
-        # MESSAGES (si disponible)
-        print("Recuperation messages...")
-        try:
-            if hasattr(client, 'discussions'):
-                discussions = client.discussions()
-                for i, msg in enumerate(discussions[:5]):
-                    result['messages'].append({
-                        'id': i + 1,
-                        'from': str(getattr(msg, 'author', 'Pronote')),
-                        'subject': getattr(msg, 'subject', 'Message'),
-                        'date': 'Recent',
-                        'unread': True,
-                        'content': getattr(msg, 'content', '')[:200]
-                    })
-            print(f"  ✅ {len(result['messages'])} messages")
-        except Exception as e:
-            print(f"  ⚠️ Messages non disponibles: {e}")
         
         print(f"\n{'='*60}")
         print("SYNCHRONISATION TERMINEE!")
@@ -306,8 +303,5 @@ def home():
 if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 5000))
-    print(f"\n{'='*60}")
-    print("   SERVEUR PRONOTE DEMARRE!")
-    print(f"   Port: {port}")
-    print(f"{'='*60}\n")
+    print(f"\nServeur demarre sur le port {port}\n")
     app.run(host='0.0.0.0', port=port, debug=False)
