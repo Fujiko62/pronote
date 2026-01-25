@@ -6,7 +6,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 import logging
 import re
 import json
-import datetime
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
@@ -27,7 +27,6 @@ def sync_pronote_clone(username, password, pronote_url):
         # 1. Login
         logger.info(f"1. GET {pronote_url}")
         res = session.get(pronote_url, allow_redirects=True)
-        
         soup = BeautifulSoup(res.text, 'html.parser')
         form = soup.find('form')
         
@@ -65,10 +64,6 @@ def sync_pronote_clone(username, password, pronote_url):
                 
             if "pronote" in final_res.url.lower():
                 logger.info("✅ SUCCES : Page Pronote atteinte !")
-                
-                # 2. APPEL API JSON POUR AVOIR L'EDT
-                # Pronote charge l'EDT via un appel POST specifique
-                # On va essayer de scraper la page actuelle d'abord
                 return extract_data_from_html(final_res.text, username)
                 
         return None
@@ -97,25 +92,19 @@ def extract_data_from_html(html, username):
             full_name = title_match.group(1).strip().replace("ESPACE ÉLÈVE", "").strip()
             if full_name: data['studentData']['name'] = full_name
 
-        # 2. EMPLOI DU TEMPS (NOUVEAU !)
-        # Recherche des elements caches dans le HTML brut
-        # <span class="sr-only">de 9h25 à 10h20 HISTOIRE-GEOGRAPHIE</span>
-        
+        # 2. EMPLOI DU TEMPS
         logger.info("Analyse de l'emploi du temps...")
         
-        # On cherche tous les spans sr-only qui contiennent "de ... à ..."
+        # Jour actuel (0=Lundi)
+        # CORRECTION ICI: datetime.now() au lieu de datetime.datetime.now()
+        today_idx = datetime.now().weekday()
+        if today_idx > 4: today_idx = 0 
+        
         spans = soup.find_all('span', class_='sr-only')
-        
-        # On determine le jour actuel (lundi=0)
-        # Pronote affiche souvent l'EDT du jour ou de la semaine
-        # Pour simplifier, on met tout dans le jour 0 (Lundi) ou le jour actuel
-        today_idx = datetime.datetime.now().weekday()
-        if today_idx > 4: today_idx = 0
-        
         count = 0
+        
         for span in spans:
             text = span.get_text().strip()
-            # Regex: de HHhMM à HHhMM MATIERE
             match = re.search(r"de\s+(\d+h\d+)\s+à\s+(\d+h\d+)\s+(.+)", text, re.I)
             
             if match:
@@ -123,20 +112,14 @@ def extract_data_from_html(html, username):
                 end = match.group(2).replace('h', ':')
                 subject = match.group(3).strip()
                 
-                # Chercher le prof et la salle
-                # Ils sont souvent dans des <li> juste apres le span
+                # Chercher prof et salle
                 prof = ""
                 room = ""
-                
                 parent = span.find_parent('li')
                 if parent:
-                    # Chercher les autres li dans le meme conteneur
                     siblings = parent.find_all('li')
-                    for sib in siblings:
-                        sib_text = sib.get_text().strip()
-                        if sib_text and sib_text != subject:
-                            if not prof: prof = sib_text
-                            elif not room: room = sib_text
+                    if len(siblings) >= 1: prof = siblings[0].get_text().strip()
+                    if len(siblings) >= 2: room = siblings[1].get_text().strip()
                 
                 # Couleur
                 color = 'bg-indigo-500'
@@ -145,7 +128,6 @@ def extract_data_from_html(html, username):
                 elif 'math' in subj_lower: color = 'bg-blue-600'
                 elif 'fran' in subj_lower: color = 'bg-pink-500'
                 elif 'angl' in subj_lower: color = 'bg-emerald-500'
-                elif 'phys' in subj_lower: color = 'bg-purple-600'
                 elif 'svt' in subj_lower: color = 'bg-green-600'
                 
                 data['schedule'][today_idx].append({
@@ -159,11 +141,10 @@ def extract_data_from_html(html, username):
                 
         logger.info(f"✅ {count} cours trouves !")
         
-        # Si on a trouve des cours, on met a jour le message
         if count > 0:
-            msg = f"Authentification réussie ! {count} cours récupérés pour aujourd'hui."
+            msg = f"Authentification réussie ! {count} cours récupérés."
         else:
-            msg = "Authentification réussie ! (Aucun cours détecté dans le HTML)"
+            msg = "Authentification réussie ! (Aucun cours détecté)"
             
         data['messages'].append({
             'id': 1, 'from': 'Système', 'subject': 'Connexion Réussie', 
@@ -181,11 +162,8 @@ def sync_pronote():
         req = request.json
         url = req.get('schoolUrl', '')
         if not url.endswith('/'): url += '/'
-        
         result = sync_pronote_clone(req.get('username'), req.get('password'), url + 'eleve.html')
-        
-        if result:
-            return jsonify(result)
+        if result: return jsonify(result)
         return jsonify({'error': 'Échec de connexion'}), 401
     except Exception as e:
         return jsonify({'error': str(e)}), 500
