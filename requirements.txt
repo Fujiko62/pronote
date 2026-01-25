@@ -1,0 +1,4 @@
+flask==3.0.0
+flask-cors==4.0.0
+pronotepy==2.14.0
+gunicorn==21.2.0
