@@ -31,11 +31,10 @@ def sync_pronote_clone(username, password, pronote_url):
     })
     
     try:
-        # 2. Requete Initiale sur Pronote (pour déclencher la redirection CAS)
+        # 2. Requete Initiale sur Pronote
         logger.info(f"1. GET {pronote_url}")
         res = session.get(pronote_url, allow_redirects=True)
         
-        # On doit atterrir sur la page de login de l'ENT
         logger.info(f"   Redirigé vers : {res.url}")
         
         # 3. Récupération du formulaire ENT
@@ -48,7 +47,6 @@ def sync_pronote_clone(username, password, pronote_url):
                 parsed = urlparse(res.url)
                 action = f"{parsed.scheme}://{parsed.netloc}{action}"
             
-            # Récupérer le callback (le lien de retour vers Pronote)
             parsed_url = urlparse(res.url)
             callback = parse_qs(parsed_url.query).get('callback', [''])[0]
             if callback and '?' not in action:
@@ -56,12 +54,10 @@ def sync_pronote_clone(username, password, pronote_url):
             
             logger.info(f"   Formulaire trouvé, action : {action}")
             
-            # Chercher les noms des champs (email/username)
             user_field = 'email'
             if soup.find('input', {'name': 'username'}): user_field = 'username'
             
             # 4. Envoi des identifiants (POST)
-            # IMPORTANT : On ajoute les headers spécifiques pour le POST
             post_headers = {
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'Origin': 'https://ent.seine-et-marne.fr',
@@ -79,7 +75,7 @@ def sync_pronote_clone(username, password, pronote_url):
             logger.info(f"   Status POST : {res_login.status_code}")
             logger.info(f"   URL après login : {res_login.url}")
             
-            # 5. Si on est revenu sur l'ENT au lieu de Pronote, forcer le callback
+            # 5. Forcer le callback si nécessaire
             final_res = res_login
             if "ent.seine-et-marne" in res_login.url and callback:
                 logger.info("   Redirection manuelle vers le callback...")
@@ -104,18 +100,43 @@ def extract_data(html, username):
         'schedule': [[], [], [], [], []], 'homework': [], 'grades': [], 'auth_success': True
     }
     
-    # Nom
-    m_nom = re.search(r"Nom\s*:\s*['\"]([^'\"]+)['\"]", html)
-    m_pre = re.search(r"Prenom\s*:\s*['\"]([^'\"]+)['\"]", html)
-    if m_nom and m_pre:
-        data['studentData']['name'] = f"{m_pre.group(1)} {m_nom.group(1)}"
-        
-    # Classe
-    m_class = re.search(r"Classe\s*:\s*['\"]([^'\"]+)['\"]", html)
-    if m_class:
-        data['studentData']['class'] = m_class.group(1)
-        
-    return data
+    try:
+        # 1. NOM dans le titre
+        title_match = re.search(r"<title>PRONOTE\s*-\s*([^-\n]+)", html, re.I)
+        if title_match:
+            full_name = title_match.group(1).strip()
+            full_name = full_name.replace("ESPACE ÉLÈVE", "").strip()
+            data['studentData']['name'] = full_name
+
+        # 2. NOM dans le JS
+        m_nom = re.search(r"Nom\s*:\s*['\"]([^'\"]+)['\"]", html)
+        m_pre = re.search(r"Prenom\s*:\s*['\"]([^'\"]+)['\"]", html)
+        if m_nom and m_pre:
+            data['studentData']['name'] = f"{m_pre.group(1)} {m_nom.group(1)}"
+
+        # 3. CLASSE
+        m_class = re.search(r"Classe\s*:\s*['\"]([^'\"]+)['\"]", html)
+        if m_class:
+            data['studentData']['class'] = m_class.group(1)
+        else:
+            class_regex = re.search(r"\b([3456])(?:EME|ème|e)?\s*([A-Z0-9])\b", html, re.I)
+            if class_regex:
+                data['studentData']['class'] = f"{class_regex.group(1)}ème {class_regex.group(2)}"
+
+        # Message de succès
+        data['messages'].append({
+            'id': 1,
+            'from': 'Système',
+            'subject': 'Connexion Réussie',
+            'date': 'Maintenant',
+            'unread': True,
+            'content': f"Bienvenue {data['studentData']['name']} ! La connexion à l'ENT est établie."
+        })
+
+        return data
+    except Exception as e:
+        logger.error(f"Erreur extraction: {e}")
+        return data
 
 @app.route('/sync', methods=['POST'])
 def sync_pronote():
