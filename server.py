@@ -15,57 +15,64 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def extract_surgical(html, username):
-    """Extraction ultra-précise basée sur tes logs"""
+def extract_surgical_data(html, username):
+    """Extraction basée sur tes découvertes réelles dans le code de ton collège"""
     data = {
-        'studentData': {'name': username.replace('.', ' ').title(), 'class': 'Détection...', 'average': 0, 'rank': 1},
+        'studentData': {
+            'name': username.replace('.', ' ').title(), 
+            'class': 'Classe inconnue', 
+            'average': 0
+        },
         'schedule': [[], [], [], [], []],
         'homework': [], 'grades': [], 'messages': [], 'subjectAverages': [],
         'auth_success': True,
-        'debug_info': {
-            'html_size': len(html),
-            'found_spans': 0,
-            'raw_text_sample': html[:500]
-        }
+        'raw_found': [] # Pour le bouton debug
     }
 
     try:
         soup = BeautifulSoup(html, 'html.parser')
         
-        # 1. NOM (depuis le titre ou le header)
+        # 1. Extraction du NOM (depuis le titre de la page)
         title = soup.title.string if soup.title else ""
         if "-" in title:
             data['studentData']['name'] = title.split('-')[1].strip().replace("ESPACE ÉLÈVE", "").strip()
 
-        # 2. EMPLOI DU TEMPS (Ton format exact !)
+        # 2. Extraction de l'EMPLOI DU TEMPS (ton format !)
         day_idx = datetime.datetime.now().weekday()
         if day_idx > 4: day_idx = 0 
         
+        # On cherche tous les spans sr-only
         spans = soup.find_all('span', class_='sr-only')
-        data['debug_info']['found_spans'] = len(spans)
-        
         for span in spans:
             text = span.get_text(" ").strip()
-            # de 8h30 à 9h25 FRANCAIS
+            data['raw_found'].append(text)
+            
+            # Format détecté : "de 9h25 à 10h20 HISTOIRE-GEOGRAPHIE"
             m = re.search(r"de\s+(\d+h\d+)\s+à\s+(\d+h\d+)\s+(.+)", text, re.I)
             if m:
                 subj = m.group(3).strip()
                 if "pause" in subj.lower(): continue
 
+                # On cherche le prof et la salle (souvent les <li> suivants)
+                parent_li = span.find_parent('li')
+                prof, room = "Professeur", "Salle"
+                if parent_li:
+                    details = [d.get_text().strip() for d in parent_li.find_all('li') if d.get_text().strip() and d.get_text().strip() != subj]
+                    if len(details) >= 1: prof = details[0]
+                    if len(details) >= 2: room = details[1]
+
                 data['schedule'][day_idx].append({
                     'time': f"{m.group(1).replace('h', ':')} - {m.group(2).replace('h', ':')}",
-                    'subject': subj, 'teacher': "Professeur", 'room': "Salle", 'color': 'bg-indigo-500'
+                    'subject': subj, 'teacher': prof, 'room': room, 'color': 'bg-indigo-500'
                 })
 
-        # 3. LA CLASSE (Recherche de motifs comme 3EME, 4EME...)
-        class_match = re.search(r"(\d+(?:EME|eme|ème|A|B|C|D))\b", html)
-        if class_match:
-            data['studentData']['class'] = class_match.group(1)
+        # 3. Extraction de la CLASSE
+        class_m = re.search(r"(\d+(?:EME|eme|ème|A|B|C|D))\b", html)
+        if class_m:
+            data['studentData']['class'] = class_m.group(1)
 
     except Exception as e:
-        logger.error(f"Error: {e}")
-        data['debug_info']['error'] = str(e)
-        
+        logger.error(f"Erreur scrap: {e}")
     return data
 
 @app.route('/sync', methods=['POST'])
@@ -78,20 +85,17 @@ def sync():
         s = requests.Session()
         s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'})
         
-        # 1. Login
+        # 1. Login au portail
         res = s.get(url + "eleve.html", allow_redirects=True)
         callback = parse_qs(urlparse(res.url).query).get('callback', [''])[0]
         s.post("https://ent.seine-et-marne.fr/auth/login", data={'email': u, 'password': p}, allow_redirects=True)
         
-        # 2. Rebond
-        target = unquote(callback) if callback else url + "eleve.html"
-        res_final = s.get(target, allow_redirects=True)
-        
-        # Securité redirection
-        if "seine-et-marne" in res_final.url:
+        # 2. Rebond Pronote
+        res_final = s.get(unquote(callback) if callback else url + "eleve.html", allow_redirects=True)
+        if "ent.seine-et-marne" in res_final.url:
             res_final = s.get(url + "eleve.html", allow_redirects=True)
 
-        return jsonify(extract_surgical(res_final.text, u))
+        return jsonify(extract_surgical_data(res_final.text, u))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
