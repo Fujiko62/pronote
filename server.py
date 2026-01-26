@@ -2,7 +2,7 @@ import os
 import re
 import json
 import logging
-import datetime
+from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
@@ -16,115 +16,123 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def extract_data_from_html(html, username):
-    """Extraction optimized for ENT77 / Pronote layout"""
+    """Extraction des données depuis le code HTML de Pronote"""
     data = {
         'studentData': {
             'name': username.replace('.', ' ').title(), 
             'class': 'Non détectée', 
-            'average': 15.5, 
-            'rank': 1, 
-            'totalStudents': 28
+            'average': 0, 'rank': 1, 'totalStudents': 30
         },
         'schedule': [[], [], [], [], []],
-        'homework': [],
-        'grades': [],
-        'messages': [],
-        'subjectAverages': [],
+        'homework': [], 'grades': [], 'messages': [], 'subjectAverages': [],
         'auth_success': True
     }
 
     try:
         soup = BeautifulSoup(html, 'html.parser')
         
-        # 1. FIND REAL NAME (from title or scripts)
+        # 1. Extraction du NOM RÉEL
+        # On cherche dans le titre : PRONOTE - NOM Prénom - ESPACE ÉLÈVE
         title_match = re.search(r"PRONOTE\s*-\s*([^/|-]+)", html, re.I)
         if title_match:
             data['studentData']['name'] = title_match.group(1).strip().replace("ESPACE ÉLÈVE", "").strip()
 
-        # 2. FIND CLASS (search for patterns like 3EME B, 4e 2, etc.)
+        # 2. Extraction de la CLASSE
+        # On cherche des motifs comme "3EME 4" ou "4EME B"
         class_match = re.search(r"(\d+(?:EME|eme|ème|EME)\s*[A-Z0-9])", html)
         if class_match:
             data['studentData']['class'] = class_match.group(1)
 
-        # 3. EXTRACT SCHEDULE (Using your discovered sr-only pattern)
-        # We target the current day (0=Monday, etc.)
-        day_idx = datetime.datetime.now().weekday()
-        if day_idx > 4: day_idx = 0 
+        # 3. Extraction de l'EMPLOI DU TEMPS (Format sr-only détecté)
+        day_idx = datetime.now().weekday()
+        if day_idx > 4: day_idx = 0 # Lundi si weekend
         
         spans = soup.find_all('span', class_='sr-only')
         count = 0
         for span in spans:
             text = span.get_text(" ")
-            # Pattern: "de 9h25 à 10h20 MATIERE"
+            # Format : "de 9h25 à 10h20 HISTOIRE-GEOGRAPHIE"
             m = re.search(r"de\s+(\d+h\d+)\s+à\s+(\d+h\d+)\s+(.+)", text, re.I)
             if m:
-                start_time = m.group(1).replace('h', ':')
-                end_time = m.group(2).replace('h', ':')
-                subject = m.group(3).strip()
-                
-                # Look for teacher and room in sibling <li> elements
+                subj = m.group(3).strip()
+                # On cherche le prof et la salle dans les <li> voisins du parent
                 parent_li = span.find_parent('li')
-                prof, room = "Professeur", "Salle"
+                prof, salle = "Professeur", "Salle"
                 if parent_li:
-                    # Find all sub-lis that are not the subject itself
-                    details = [d.get_text().strip() for d in parent_li.find_all('li') if d.get_text().strip() and d.get_text().strip() != subject]
+                    details = [d.get_text().strip() for d in parent_li.find_all('li') if d.get_text().strip() and d.get_text().strip() != subj]
                     if len(details) >= 1: prof = details[0]
-                    if len(details) >= 2: room = details[1]
+                    if len(details) >= 2: salle = details[1]
 
                 data['schedule'][day_idx].append({
-                    'time': f"{start_time} - {end_time}",
-                    'subject': subject,
-                    'teacher': prof,
-                    'room': room,
-                    'color': 'bg-indigo-500'
+                    'time': f"{m.group(1).replace('h', ':')} - {m.group(2).replace('h', ':')}",
+                    'subject': subj, 'teacher': prof, 'room': salle, 'color': 'bg-indigo-500'
                 })
                 count += 1
         
         data['schedule'][day_idx].sort(key=lambda x: x['time'])
-
-        data['messages'].append({
-            'id': 1, 'from': 'Système', 'subject': 'Synchronisation OK', 'date': 'Maintenant', 'unread': True,
-            'content': f"Connexion réussie ! {count} cours ont été lus sur votre page d'accueil."
-        })
         
+        if count > 0:
+            data['messages'].append({
+                'id': 1, 'from': 'Système', 'subject': 'Synchronisation OK', 'date': 'Maintenant',
+                'content': f"Connexion réussie ! {count} cours ont été lus sur votre page d'accueil."
+            })
+            
     except Exception as e:
-        logger.error(f"Error during extraction: {e}")
+        logger.error(f"Erreur scrap: {e}")
         
     return data
 
 @app.route('/sync', methods=['POST'])
 def sync():
     try:
-        data = request.json
-        u, p, url = data.get('username'), data.get('password'), data.get('schoolUrl')
+        req = request.json
+        u, p, url = req.get('username'), req.get('password'), req.get('schoolUrl')
         if not url.endswith('/'): url += '/'
         
         s = requests.Session()
-        s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'})
+        # On imite un navigateur moderne
+        s.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'fr-FR,fr;q=0.9'
+        })
         
-        # 1. Hit Pronote to get the ENT login URL with callback
-        init_res = s.get(url + "eleve.html", allow_redirects=True)
-        login_url = init_res.url
+        # 1. Accès Pronote pour récupérer l'URL de redirection CAS
+        logger.info(f"Étape 1 : Accès Pronote {url}")
+        res = s.get(url + "eleve.html", allow_redirects=True)
         
-        # 2. Login to ENT77
-        # Note: Seine-et-Marne portal uses 'email' and 'password' in their login form
-        s.post("https://ent.seine-et-marne.fr/auth/login", data={'email': u, 'password': p}, allow_redirects=True)
+        # On extrait le 'service' qui est l'URL de retour après le login
+        parsed_url = urlparse(res.url)
+        params = parse_qs(parsed_url.query)
+        service_url = params.get('service', [None])[0]
         
-        # 3. Follow the redirect back to Pronote (this triggers the session)
-        callback = parse_qs(urlparse(login_url).query).get('callback', [''])[0]
-        if callback:
-            res_final = s.get(unquote(callback), allow_redirects=True)
+        # 2. Login à l'ENT
+        logger.info("Étape 2 : Authentification ENT Seine-et-Marne")
+        # On poste sur l'URL de login de l'ENT
+        login_data = {'email': u, 'password': p}
+        # On utilise l'URL de login du portail
+        res_auth = s.post("https://ent.seine-et-marne.fr/auth/login", data=login_data, allow_redirects=True)
+        
+        # 3. Accès à Pronote via le service CAS
+        # C'est l'étape où on "clique" sur l'application
+        logger.info("Étape 3 : Passage du portail vers Pronote")
+        if service_url:
+            res_final = s.get(unquote(service_url), allow_redirects=True)
         else:
             res_final = s.get(url + "eleve.html", allow_redirects=True)
             
-        # Fallback if still on ENT page
+        # Si on est toujours sur l'ENT (portail d'icônes), on force l'URL Pronote
         if "ent.seine-et-marne" in res_final.url:
+            logger.info("Redirection manuelle car coincé sur le portail...")
             res_final = s.get(url + "eleve.html", allow_redirects=True)
 
+        logger.info(f"Arrivée finale : {res_final.url}")
+        
+        # 4. Extraction des données
         return jsonify(extract_data_from_html(res_final.text, u))
         
     except Exception as e:
-        logger.error(f"Sync error: {e}")
+        logger.error(f"Erreur globale : {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health')
