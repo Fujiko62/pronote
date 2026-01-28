@@ -1,20 +1,26 @@
-FROM python:3.10-bookworm
+FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
 
 WORKDIR /app
 
-# Copier les fichiers
+# 1. Copier les fichiers
 COPY requirements.txt .
 COPY server.py .
 
-# Installer les dépendances Python
+# 2. Créer un environnement virtuel (C'est le secret !)
+RUN python -m venv /opt/venv
+# 3. Activer l'environnement pour toutes les commandes suivantes
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 4. Installer les dépendances DANS l'environnement virtuel
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir playwright==1.41.0
 
-# Installer les navigateurs et dépendances
+# 5. Installer Chrome
 RUN playwright install chromium
-RUN playwright install-deps chromium
 
+# 6. Configuration
 EXPOSE 8000
 
+# 7. Démarrer le serveur via l'environnement virtuel
 CMD ["gunicorn", "server:app", "--bind", "0.0.0.0:8000", "--timeout", "120", "--workers", "1"]
