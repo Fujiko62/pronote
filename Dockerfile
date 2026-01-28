@@ -1,11 +1,4 @@
-# Utiliser une image Python officielle
-FROM python:3.10-slim
-
-# Installer les dépendances système pour Playwright
-RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    && rm -rf /var/lib/apt/lists/*
+FROM python:3.10-bookworm
 
 WORKDIR /app
 
@@ -18,7 +11,7 @@ RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir playwright==1.41.0
 
-# Installer les navigateurs et leurs dépendances système
+# Installer les navigateurs et dépendances
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
