@@ -313,6 +313,7 @@ def home():
     return jsonify({'name': 'Pronote Bridge (Chrome)', 'status': 'running 🚀', 'method': 'Playwright/Chrome'})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 8000))
     logger.info(f"🚀 Serveur Playwright sur port {port}")
     app.run(host='0.0.0.0', port=port)
+
