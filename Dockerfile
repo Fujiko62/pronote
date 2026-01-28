@@ -1,17 +1,28 @@
-# On part de l'image officielle Microsoft qui contient DÉJÀ tout !
-FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
+# Utiliser une image Python officielle (plus stable)
+FROM python:3.10-bookworm
 
-# On définit le dossier de travail
+# Installer les dépendances système
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# On installe juste Flask et gunicorn
-RUN pip install Flask==3.0.0 flask-cors==4.0.0 gunicorn==21.2.0
-
-# On copie ton script
+# Copier les fichiers
+COPY requirements.txt .
 COPY server.py .
 
-# On expose le port 8000
+# Installer les dépendances Python
+RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir playwright==1.41.0
+
+# Installer les navigateurs Playwright
+RUN playwright install chromium
+RUN playwright install-deps chromium
+
 EXPOSE 8000
 
-# On lance le serveur
+# Lancer le serveur avec python directement (plus simple)
 CMD ["gunicorn", "server:app", "--bind", "0.0.0.0:8000", "--timeout", "120", "--workers", "1"]
