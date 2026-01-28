@@ -2,253 +2,112 @@ import os
 import re
 import logging
 import datetime
-import asyncio
+import cloudscraper
+from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from urllib.parse import urlparse, parse_qs, unquote, urljoin
 
 app = Flask(__name__)
 CORS(app)
 
-# Logs détaillés
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%dT%H:%M:%S')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# Configuration école
 CONFIG = {
     'SCHOOL_URL': 'https://0771068t.index-education.net/pronote/',
     'SCHOOL_NAME': 'Collège Les Creuzets'
 }
 
 def log_step(step, message):
-    icons = {'start': '🚀', 'browser': '🌐', 'auth': '🔐', 'click': '👆', 'type': '⌨️', 'wait': '⏳', 'extract': '🔍', 'success': '✅', 'error': '❌', 'info': 'ℹ️'}
+    icons = {'start': '🚀', 'auth': '🔐', 'redirect': '↪️', 'extract': '🔍', 'success': '✅', 'error': '❌'}
     logger.info(f"{icons.get(step, '📌')} [{step.upper()}] {message}")
 
-async def scrape_pronote(username, password):
-    """Utilise un VRAI navigateur Chrome pour se connecter comme un élève"""
-    from playwright.async_api import async_playwright
-    
-    result = {
-        'studentData': {'name': '', 'class': '', 'average': None},
+def extract_data(html, username):
+    data = {
+        'studentData': {'name': username.split('@')[0], 'class': '', 'average': None},
         'schedule': [[], [], [], [], []],
         'homework': [],
         'grades': [],
-        'messages': [],
-        'auth_success': False,
-        'raw_found': []
+        'auth_success': True
     }
-    
-    async with async_playwright() as p:
-        log_step('browser', 'Lancement de Chrome...')
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        day_idx = datetime.datetime.now().weekday()
+        if day_idx > 4: day_idx = 0
         
-        browser = await p.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-dev-shm-usage']
-        )
-        
-        page = await browser.new_page()
-        page.set_default_timeout(60000)
-        
-        try:
-            # === ÉTAPE 1: Aller sur Pronote ===
-            log_step('browser', f"Navigation vers {CONFIG['SCHOOL_URL']}eleve.html")
-            await page.goto(f"{CONFIG['SCHOOL_URL']}eleve.html")
-            await page.wait_for_load_state('networkidle')
-            
-            log_step('info', f"URL actuelle: {page.url}")
-            result['raw_found'].append(f"URL après Pronote: {page.url}")
-            
-            # === ÉTAPE 2: On est sur l'ENT, chercher le formulaire ===
-            if 'ent' in page.url.lower() or 'seine-et-marne' in page.url.lower():
-                log_step('auth', "Page ENT détectée, recherche du formulaire...")
-                
-                await asyncio.sleep(5)
-                
-                # Chercher le champ email/identifiant
-                email_input = None
-                for selector in ['input[name="email"]', 'input[name="username"]', 'input[type="email"]', 'input[id="email"]', 'input[id="username"]', '#email', '#username']:
-                    try:
-                        if await page.locator(selector).count() > 0:
-                            email_input = selector
-                            log_step('success', f"Champ identifiant trouvé: {selector}")
-                            break
-                    except:
-                        continue
-                
-                # Chercher le champ mot de passe
-                password_input = None
-                for selector in ['input[name="password"]', 'input[type="password"]', 'input[id="password"]', '#password']:
-                    try:
-                        if await page.locator(selector).count() > 0:
-                            password_input = selector
-                            log_step('success', f"Champ mot de passe trouvé: {selector}")
-                            break
-                    except:
-                        continue
-                
-                if email_input and password_input:
-                    log_step('type', f"Saisie identifiant: {username[:10]}***")
-                    await page.fill(email_input, username)
-                    
-                    log_step('type', "Saisie mot de passe: ********")
-                    await page.fill(password_input, password)
-                    
-                    # Chercher et cliquer sur le bouton de connexion
-                    submit_clicked = False
-                    for selector in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Connexion")', 'button:has-text("Se connecter")', '.btn-primary', '#submit']:
-                        try:
-                            if await page.locator(selector).count() > 0:
-                                log_step('click', f"Clic sur: {selector}")
-                                await page.click(selector)
-                                submit_clicked = True
-                                break
-                        except:
-                            continue
-                    
-                    if submit_clicked:
-                        log_step('wait', "Attente après connexion...")
-                        await page.wait_for_load_state('networkidle')
-                        await asyncio.sleep(5)
-                        
-                        log_step('info', f"URL après login: {page.url}")
-                        result['raw_found'].append(f"URL après login: {page.url}")
-                else:
-                    log_step('error', "Champs de login non trouvés!")
-                    result['raw_found'].append("Champs login non trouvés")
-            
-            # === ÉTAPE 3: Chercher le lien Pronote si on est sur le portail ENT ===
-            if 'pronote' not in page.url.lower() and 'index-education' not in page.url.lower():
-                log_step('browser', "Recherche du lien Pronote...")
-                
-                for selector in ['a:has-text("Pronote")', 'a:has-text("PRONOTE")', 'a[href*="pronote"]', 'a[href*="index-education"]', '[data-app*="pronote"]']:
-                    try:
-                        if await page.locator(selector).count() > 0:
-                            log_step('click', f"Clic sur Pronote: {selector}")
-                            await page.click(selector)
-                            await page.wait_for_load_state('networkidle')
-                            await asyncio.sleep(5)
-                            log_step('info', f"URL après clic Pronote: {page.url}")
-                            break
-                    except:
-                        continue
-            
-            # === ÉTAPE 4: Vérifier qu'on est sur Pronote ===
-            current_url = page.url
-            log_step('info', f"URL finale: {current_url}")
-            
-            if 'pronote' in current_url.lower() or 'index-education' in current_url.lower():
-                result['auth_success'] = True
-                log_step('success', "PAGE PRONOTE ATTEINTE!")
-                
-                await asyncio.sleep(5)
-                
-                # Nom de l'élève
-                title = await page.title()
-                log_step('extract', f"Titre: {title}")
-                result['raw_found'].append(f"Titre: {title}")
-                
-                if title and '-' in title:
-                    for part in title.split('-'):
-                        clean = part.strip().replace('ESPACE ÉLÈVE', '').replace('PRONOTE', '').strip()
-                        if clean and len(clean) > 2:
-                            result['studentData']['name'] = clean
-                            log_step('success', f"Nom trouvé: {clean}")
-                            break
-                
-                # Contenu de la page
-                content = await page.content()
-                log_step('info', f"Taille page: {len(content)} bytes")
-                
-                # Classe
-                class_match = re.search(r'(\d+(?:ème|EME|e|è)\s*[A-Z0-9]?)', content, re.I)
-                if class_match:
-                    result['studentData']['class'] = class_match.group(1).upper()
-                    log_step('success', f"Classe: {result['studentData']['class']}")
-                
-                # Emploi du temps
-                day_idx = datetime.datetime.now().weekday()
-                if day_idx > 4:
-                    day_idx = 0
-                
-                sr_only_texts = await page.evaluate('''() => {
-                    return Array.from(document.querySelectorAll('.sr-only, [class*="sr-only"]'))
-                        .map(el => el.textContent.trim())
-                        .filter(t => t.length > 5);
-                }''')
-                
-                log_step('extract', f"Textes sr-only trouvés: {len(sr_only_texts)}")
-                
-                for text in sr_only_texts:
-                    match = re.search(r"de\s+(\d{1,2}h\d{2})\s+à\s+(\d{1,2}h\d{2})\s+(.+)", text, re.I)
-                    if match:
-                        subject = match.group(3).strip()
-                        if 'pause' not in subject.lower() and 'récré' not in subject.lower():
-                            course = {
-                                'time': f"{match.group(1).replace('h', ':')} - {match.group(2).replace('h', ':')}",
-                                'subject': subject,
-                                'teacher': '',
-                                'room': 'Salle'
-                            }
-                            result['schedule'][day_idx].append(course)
-                            result['raw_found'].append(f"Cours: {subject}")
-                            log_step('success', f"Cours trouvé: {subject}")
-                
-                log_step('info', f"Cours aujourd'hui: {len(result['schedule'][day_idx])}")
-                
-            else:
-                log_step('error', f"Pas sur Pronote! URL: {current_url}")
-                result['raw_found'].append(f"Échec - URL finale: {current_url}")
-        
-        except Exception as e:
-            log_step('error', f"Erreur: {str(e)}")
-            result['raw_found'].append(f"Erreur: {str(e)}")
-        
-        finally:
-            await browser.close()
-            log_step('browser', "Navigateur fermé")
-    
-    return result
+        for span in soup.find_all('span', class_='sr-only'):
+            text = span.get_text(' ', strip=True)
+            m = re.search(r'de\s+(\d{1,2}h\d{2})\s+à\s+(\d{1,2}h\d{2})\s+(.+)', text, re.I)
+            if m and 'pause' not in m.group(3).lower():
+                data['schedule'][day_idx].append({
+                    'time': f"{m.group(1).replace('h',':')} - {m.group(2).replace('h',':')}",
+                    'subject': m.group(3).strip(),
+                    'room': 'Salle'
+                })
+    except Exception as e:
+        logger.error(f"Erreur extraction: {e}")
+    return data
 
 @app.route('/sync', methods=['POST'])
 def sync():
     try:
-        data = request.json
-        username = data.get('username', '')
-        password = data.get('password', '')
+        req = request.json
+        u, p = req.get('username'), req.get('password')
+        log_step('start', f"Sync pour {u}")
         
-        log_step('start', "=" * 50)
-        log_step('start', "NOUVELLE SYNCHRONISATION PLAYWRIGHT")
-        log_step('start', "=" * 50)
-        log_step('info', f"Utilisateur: {username[:15]}***")
+        scraper = cloudscraper.create_scraper(browser={'browser': 'chrome','platform': 'windows','mobile': False})
         
-        if not username or not password:
-            return jsonify({'error': 'Identifiants requis', 'auth_success': False}), 400
+        # 1. Accès Pronote
+        log_step('auth', f"Accès à {CONFIG['SCHOOL_URL']}")
+        r = scraper.get(f"{CONFIG['SCHOOL_URL']}eleve.html")
         
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(scrape_pronote(username, password))
-        loop.close()
+        # 2. Callback
+        callback = parse_qs(urlparse(r.url).query).get('callback', [None])[0]
+        if not callback:
+            m = re.search(r'callback=([^&"\']+)', r.text)
+            if m: callback = unquote(m.group(1))
+            
+        if not callback:
+            return jsonify({'error': 'Callback introuvable'}), 401
+            
+        # 3. Login ENT
+        soup = BeautifulSoup(r.text, 'html.parser')
+        form = soup.find('form')
+        if not form:
+            r = scraper.get("https://ent77.seine-et-marne.fr/auth/login")
+            soup = BeautifulSoup(r.text, 'html.parser')
+            form = soup.find('form')
+            
+        action = form.get('action')
+        if not action.startswith('http'): action = urljoin(r.url, action)
+            
+        data = {i['name']: i.get('value', '') for i in form.find_all('input') if i.get('name')}
+        data['email'] = u
+        data['password'] = p
         
-        log_step('success', "=" * 50)
-        log_step('info', f"Auth: {'✅' if result['auth_success'] else '❌'}")
-        log_step('info', f"Élève: {result['studentData']['name']}")
-        log_step('info', f"Cours: {sum(len(d) for d in result['schedule'])}")
-        log_step('success', "=" * 50)
+        log_step('auth', "Envoi login...")
+        r = scraper.post(action, data=data)
         
+        if 'auth/login' in r.url:
+            return jsonify({'error': 'Identifiants incorrects', 'auth_success': False}), 401
+            
+        # 4. Retour Pronote
+        log_step('redirect', "Retour Pronote...")
+        r = scraper.get(unquote(callback))
+        
+        result = extract_data(r.text, u)
+        log_step('success', "Terminé !")
         return jsonify(result)
-    
+        
     except Exception as e:
-        log_step('error', f"Erreur: {str(e)}")
+        log_step('error', str(e))
         return jsonify({'error': str(e), 'auth_success': False}), 500
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'version': '3.0-playwright', 'school': CONFIG['SCHOOL_NAME']})
-
-@app.route('/')
-def home():
-    return jsonify({'name': 'Pronote Bridge (Chrome)', 'status': 'running 🚀', 'method': 'Playwright/Chrome'})
+    return jsonify({'status': 'ok', 'version': '5.0-cloudscraper'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
-    logger.info(f"🚀 Serveur Playwright sur port {port}")
     app.run(host='0.0.0.0', port=port)
