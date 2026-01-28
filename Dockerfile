@@ -1,24 +1,27 @@
-FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
+# Utiliser une image Python officielle
+FROM python:3.10-slim
+
+# Installer les dépendances système pour Playwright
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copier les fichiers
-COPY server.py .
 COPY requirements.txt .
+COPY server.py .
 
-# Installer les dépendances dans le système global
+# Installer les dépendances Python
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir playwright==1.41.0
 
-# Installer les navigateurs Playwright
+# Installer les navigateurs et leurs dépendances système
 RUN playwright install chromium
-
-# Variables d'environnement pour Python
-ENV PYTHONPATH=/usr/local/lib/python3.10/site-packages
-ENV PATH="/usr/local/bin:${PATH}"
+RUN playwright install-deps chromium
 
 EXPOSE 8000
 
-# Démarrage avec le chemin complet de gunicorn
-CMD ["/usr/local/bin/gunicorn", "server:app", "--bind", "0.0.0.0:8000", "--timeout", "120", "--workers", "1"]
+CMD ["gunicorn", "server:app", "--bind", "0.0.0.0:8000", "--timeout", "120", "--workers", "1"]
