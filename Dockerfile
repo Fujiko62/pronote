@@ -4,7 +4,8 @@ WORKDIR /app
 
 COPY server.py .
 
-RUN pip install --no-cache-dir Flask==3.0.0 flask-cors==4.0.0 gunicorn==21.2.0
+RUN pip install --no-cache-dir Flask==3.0.0 flask-cors==4.0.0 gunicorn==21.2.0 playwright==1.41.0
+
 RUN playwright install chromium
 
 EXPOSE 8000
