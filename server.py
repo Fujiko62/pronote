@@ -130,7 +130,7 @@ def sync():
             return jsonify({'error': 'Formulaire login introuvable'}), 401
             
         action = form.get('action')
-        if action and not action.startswith('http'):
+        if not action.startswith('http'):
             action = urljoin(r.url, action)
         elif not action:
             action = r.url
